@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 # ---------- DATA ------------------
-CSV = '../lifetimes_data_sample.csv'
+CSV = '../lifetimes_data_simple.csv'
 NPZ_DIR = Path('../distance_matrix-kopia/')
 Cache_dir = Path('cache'); Cache_dir.mkdir(exist_ok=True)
 NPZ_key = None
@@ -23,7 +23,7 @@ Latents = [2,4,8,16,32,64] # bottelneck of encoder
 MAP_Latent= 16
 Holdout = 0.2 # 20% of cache data is not seen in training by model (generalizaion check)
 Max_train_frame = 100000 #how much frames is used in training
-Epoches = 150
+Epoches = 20
 Batch = 32
 LR = 1e-3
 WD = 1e-4
@@ -31,7 +31,7 @@ PCA_frames=10000
 EVAL_subset = 1 #it determinates which frames are taken to testing (1 means all frames)
 BIN_ns=10
 SEED=42
-Out=Path("Autoencoder_results"); Out.mkdir(exist_ok=True)
+Out=Path("../Autoencoder_results_v1"); Out.mkdir(exist_ok=True)
 
 if torch.cuda.is_available():
     device = torch.device('cuda')
@@ -64,14 +64,14 @@ df = df[df.has_npz & ((df.group != "C") | Include_C)].reset_index(drop=True)
 df["npy"] = [Cache_dir / f"{p.stem}.npy" for p in df.npz]
 
 seqs = df.seq.unique()
-held = set(rng.choice(seqs, int(len(seqs))*Holdout, replace=False))
+held = set(rng.choice(seqs, max(1, round(len(seqs) * Holdout)), replace=False))
 df['split']=np.where(df.seq.isin(held), 'holdout', 'train')
 
 # Cache work
 def ensure_cache(r):
     p=r.npy
     if not p.exists():
-        with np.load(p.npz) as z:
+        with np.load(r.npz) as z:
             key = NPZ_key or (z.files[0] if len(z.files)==1 else None)
             if key is None:
                 raise KeyError(f"{r.npz.name} has several arrayes {z.files}; set NPZ_Key")
@@ -110,7 +110,7 @@ class Frames(Dataset):
         return torch.from_numpy(x + x.T).unsqueeze(0), k, pos
 
 def all_it(runs):
-    return [(k,p) for k,m in enumerate(runs.m.values()) for p in range(m)]
+    return [(k,p) for k,m in enumerate(runs.m.values) for p in range(m)]
 
 paths = list(df.npy)
 train_rows = np.flatnonzero((df.split == "train").values)
@@ -153,7 +153,7 @@ class ConvEncoder(nn.Module):
     def forward(self, x):
         x=F.pad(x, (1,1,1,1), mode='replicate')
         z=self.to_z(self.encoder(x).flatten(1))
-        out = self.decoder(self.form_z(z).view(-1,128,10,10))[:,:,1:-1.,1:-1]
+        out = self.decoder(self.from_z(z).view(-1,128,10,10))[:,:,1:-1,1:-1]
         return 0.5*(out+out.transpose(2,3)), z
 
 def recon_loss(out,x):
@@ -218,7 +218,7 @@ for i, L in enumerate(Latents):
     print(f"\n=== bottleneck {L}")
     model = train(L)
     r = eval(model, L, with_pca=(i == 0), map_rows=(L == MAP_Latent))
-    meta[f"ae_{L}"] = r["ae"]
+    meta[f"enc_{L}"] = r["enc"]
     if i == 0:
         for LL, e in r["pca"].items():
             meta[f"pca_{LL}"] = e
@@ -230,7 +230,7 @@ meta.to_csv(Out / "frame_errors.csv.gz", index=False)
 # %% summary table
 rows = []
 for L in Latents:
-    for method in ["ae", "pca"]:
+    for method in ["enc", "pca"]:
         for name, d in [("all", meta), ("train seqs", meta[meta.split == "train"]),
                         ("held-out seqs", meta[meta.split == "holdout"])]:
             mse = d[f"{method}_{L}"].mean()
@@ -243,7 +243,7 @@ print(f"\nreference: mean structure only -> RMSE {np.sqrt(VAR_TOTAL) * SCALE:.3f
 
 # %% plots
 fig, axs = plt.subplots(1, 2, figsize=(11, 4))
-for method, ls in [("ae", "-"), ("pca", "--")]:
+for method, ls in [("enc", "-"), ("pca", "--")]:
     for name, c in [("all", "k"), ("held-out seqs", "tab:red")]:
         d = summary[(summary.method == method) & (summary.subset == name)]
         axs[0].plot(d.latent, d.rmse_A, ls, color=c, marker="o", label=f"{method.upper()}, {name}")
@@ -254,22 +254,22 @@ axs[1].set(xscale="log", xlabel="bottleneck size", ylabel="variance explained (R
 fig.tight_layout();
 fig.savefig(Out / "error_vs_bottleneck.png", dpi=150)
 
-col = f"ae_{MAP_Latent}"
+col = f"enc_{MAP_Latent}"
 meta["bin"] = (meta.t_ns // BIN_ns) * BIN_ns + BIN_ns / 2
 fig, ax = plt.subplots(figsize=(6, 4))
 for g, d in meta.groupby("group"):
     m = d.groupby("bin")[col].mean()
     ax.plot(m.index, np.sqrt(m) * SCALE, marker="o", label=f"group {g}")
 ax.set(xlabel="time (ns)", ylabel="RMSE (A)", title=f"AE reconstruction error over time (bottleneck {MAP_Latent})")
-ax.legend();
-fig.tight_layout();
+ax.legend()
+fig.tight_layout()
 fig.savefig(Out / "error_vs_time.png", dpi=150)
 
 fig, ax = plt.subplots(figsize=(5, 4.5))
 im = ax.imshow(np.sqrt(np.load(Out / "error_map.npy")) * SCALE, cmap="magma")
 ax.set_title(f"RMSE per residue pair (A), held-out seqs, bottleneck {MAP_Latent}")
-fig.colorbar(im);
-fig.tight_layout();
+fig.colorbar(im)
+fig.tight_layout()
 fig.savefig(Out / "error_map.png", dpi=150)
 
 # error by condition: is information lost more for some topologies / layouts?

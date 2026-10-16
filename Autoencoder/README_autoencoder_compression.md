@@ -4,7 +4,7 @@
 compressed through a small bottleneck and reconstructed without losing meaningful structure.
 
 For each bottleneck size it trains a convolutional autoencoder, tests it on all cached frames, and
-compares it with PCA of the same dimension. Errors are reported in angstrom and as variance explained (R²),
+compares it with PCA of the same dimension. Errors are reported in nanometers and as variance explained (R²),
 both on all data and on sequences that were never used for training.
 
 ## 1. Inputs
@@ -69,9 +69,9 @@ During training and testing a frame is read from the memory-mapped `.npy` file a
 
 | file | content |
 |---|---|
-| `summary.csv` | For each bottleneck size, method (`ae` or `pca`) and subset (`all`, `train seqs`, `held-out seqs`): `rmse_A` and `R2`. |
+| `summary.csv` | For each bottleneck size, method (`ae` or `pca`) and subset (`all`, `train seqs`, `held-out seqs`): `rmse_nm` and `R2`. |
 | `frame_errors.csv.gz` | One row per tested frame: run identifiers, `group`, `split`, time in ns, and the mean squared error (scaled units) for `ae_<L>` and `pca_<L>`. |
-| `error_vs_bottleneck.png` | RMSE (Å) and R² against bottleneck size, autoencoder (solid) and PCA (dashed). |
+| `error_vs_bottleneck.png` | RMSE (nm) and R² against bottleneck size, autoencoder (solid) and PCA (dashed). |
 | `error_vs_time.png` | RMSE over simulation time for the bottleneck `MAP_Latent`, per group. |
 | `error_map.npy`, `error_map.png` | Mean squared error per residue pair over held-out sequences, for `MAP_Latent`. |
 | `rmse_by_condition.csv` | RMSE per (`lay`, `top`) condition for `MAP_Latent`. |
@@ -79,7 +79,7 @@ During training and testing a frame is read from the memory-mapped `.npy` file a
 
 Definitions:
 
-- `rmse_A` = √(mean squared error) × `SCALE`, the typical error of a reconstructed distance in Å.
+- `rmse_nm` = √(mean squared error) × `SCALE`, the typical error of a reconstructed distance in nm.
 - `R2` = 1 − mean squared error / `VAR_TOTAL`, where `VAR_TOTAL` is the variance of the training sample around its mean
   structure. R² = 0 means no better than predicting the average matrix.
 - The script prints the RMSE of predicting the mean structure only. Reconstruction errors should be compared with that

@@ -12,7 +12,7 @@ NPZ_DIR = Path('../distance_matrix-kopia/')
 Cache_dir = Path('cache'); Cache_dir.mkdir(exist_ok=True)
 NPZ_key = None
 Store_DTYPE = np.float16
-Include_C=True
+Include_C=False
 
 
 # ---------- CONFIG --------------
@@ -31,7 +31,7 @@ PCA_frames=10000
 EVAL_subset = 1 #it determinates which frames are taken to testing (1 means all frames)
 BIN_ns=10
 SEED=42
-Out=Path("../Autoencoder_results_v1"); Out.mkdir(exist_ok=True)
+Out=Path("../Autoencoder_results_v2"); Out.mkdir(exist_ok=True)
 
 if torch.cuda.is_available():
     device = torch.device('cuda')
@@ -234,19 +234,19 @@ for L in Latents:
         for name, d in [("all", meta), ("train seqs", meta[meta.split == "train"]),
                         ("held-out seqs", meta[meta.split == "holdout"])]:
             mse = d[f"{method}_{L}"].mean()
-            rows.append(dict(latent=L, method=method, subset=name, rmse_A=np.sqrt(mse) * SCALE,
+            rows.append(dict(latent=L, method=method, subset=name, rmse_nm=np.sqrt(mse) * SCALE,
                              R2=1 - mse / VAR_TOTAL))
 summary = pd.DataFrame(rows)
 summary.to_csv(Out / "summary.csv", index=False)
-print(summary.pivot_table(index="latent", columns=["method", "subset"], values="rmse_A").round(3))
-print(f"\nreference: mean structure only -> RMSE {np.sqrt(VAR_TOTAL) * SCALE:.3f} A")
+print(summary.pivot_table(index="latent", columns=["method", "subset"], values="rmse_nm").round(3))
+print(f"\nreference: mean structure only -> RMSE {np.sqrt(VAR_TOTAL) * SCALE:.3f} nm")
 
 # %% plots
 fig, axs = plt.subplots(1, 2, figsize=(11, 4))
 for method, ls in [("enc", "-"), ("pca", "--")]:
     for name, c in [("all", "k"), ("held-out seqs", "tab:red")]:
         d = summary[(summary.method == method) & (summary.subset == name)]
-        axs[0].plot(d.latent, d.rmse_A, ls, color=c, marker="o", label=f"{method.upper()}, {name}")
+        axs[0].plot(d.latent, d.rmse_nm, ls, color=c, marker="o", label=f"{method.upper()}, {name}")
         axs[1].plot(d.latent, d.R2, ls, color=c, marker="o")
 axs[0].set(xscale="log", yscale="log", xlabel="bottleneck size", ylabel="reconstruction RMSE (A)")
 axs[0].legend();
@@ -260,20 +260,20 @@ fig, ax = plt.subplots(figsize=(6, 4))
 for g, d in meta.groupby("group"):
     m = d.groupby("bin")[col].mean()
     ax.plot(m.index, np.sqrt(m) * SCALE, marker="o", label=f"group {g}")
-ax.set(xlabel="time (ns)", ylabel="RMSE (A)", title=f"AE reconstruction error over time (bottleneck {MAP_Latent})")
+ax.set(xlabel="time (ns)", ylabel="RMSE (nm)", title=f"AE reconstruction error over time (bottleneck {MAP_Latent})")
 ax.legend()
 fig.tight_layout()
 fig.savefig(Out / "error_vs_time.png", dpi=150)
 
 fig, ax = plt.subplots(figsize=(5, 4.5))
 im = ax.imshow(np.sqrt(np.load(Out / "error_map.npy")) * SCALE, cmap="magma")
-ax.set_title(f"RMSE per residue pair (A), held-out seqs, bottleneck {MAP_Latent}")
+ax.set_title(f"RMSE per residue pair (nm), held-out seqs, bottleneck {MAP_Latent}")
 fig.colorbar(im)
 fig.tight_layout()
 fig.savefig(Out / "error_map.png", dpi=150)
 
 # error by condition: is information lost more for some topologies / layouts?
-by = meta.groupby(["lay", "top"])[col].mean().pipe(lambda s: np.sqrt(s) * SCALE).rename("rmse_A")
+by = meta.groupby(["lay", "top"])[col].mean().pipe(lambda s: np.sqrt(s) * SCALE).rename("rmse_nm")
 by.sort_values().to_csv(Out / "rmse_by_condition.csv")
 plt.show()
 

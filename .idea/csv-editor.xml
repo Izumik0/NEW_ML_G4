@@ -3,28 +3,21 @@
   <component name="CsvFileAttributes">
     <option name="attributeMap">
       <map>
-        <entry key="\Autoencoder_results_v1\rmse_by_condition.csv">
+        <entry key="/Autoencoder_results/Autoencoder_results_v1/rmse_by_condition.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="\Autoencoder_results_v1\summary.csv">
+        <entry key="/Autoencoder_results/Autoencoder_results_v1/rmse_by_condition_L64.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="\Autoencoder_results_v2\summary.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="\lifetimes_data_simple.csv">
+        <entry key="/Autoencoder_results/Autoencoder_results_v1/summary.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />

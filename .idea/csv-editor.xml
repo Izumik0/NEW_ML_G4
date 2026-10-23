@@ -24,6 +24,41 @@
             </Attribute>
           </value>
         </entry>
+        <entry key="\Autoencoder_results_v2\rmse_by_condition.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="\Autoencoder_results_v2\summary.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="\dihedral_ae_out\all_runs_padded\frame_error.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="\dihedral_ae_out\all_runs_padded\frame_errors_all_latents.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="\dihedral_ae_out\all_runs_padded\per_run_error_all_latents.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
       </map>
     </option>
   </component>

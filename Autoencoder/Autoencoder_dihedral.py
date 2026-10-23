@@ -12,6 +12,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -21,8 +22,9 @@ import matplotlib.pyplot as plt
 # CONFIG
 # =====================================================================
 DATA_GLOB = "../dihedrals/*/bb_dihedrals.txt"   # file or pattern
-STRIDE = 5                             # tells how much space is between taken frames
-CACHE_DIR = Path("../cache_dihedrals")
+STRIDE = 25                             # tells how much space is between taken frames
+dt = 20.0                              # time step in calc
+CACHE_DIR = Path("cache_dihedrals")
 GROUP_MODE = "pad"                      # "pad" | "group"
 MIN_RUNS_PER_GROUP = 1                  # group mode: skip groups with fewer runs
 
@@ -30,11 +32,11 @@ SPLIT_MODE = "auto"                     # "auto" | "run" | "time" | "all"
 TEST_FRAC = 0.2
 TIME_GAP_FRAMES = 25
 
-LATENT_SWEEP = [8,16]
-LATENT_DETAIL = 8
+LATENT_SWEEP = [2,4,8,16,32,64]
+LATENT_DETAIL = 32
 HIDDEN = (256, 128)
-EPOCHS = 5
-BATCH_SIZE = 128
+EPOCHS = 15
+BATCH_SIZE = 512
 LR = 1e-3
 SEED = 0
 OUT_DIR = Path("../dihedral_ae_out")
@@ -157,16 +159,18 @@ def train_ae(Xtr, Mtr, Xte, Mte, latent):
 def experiment(run_list, tag):
     out = OUT_DIR / tag
     out.mkdir(exist_ok=True, parents=True)
-    all_names = sorted({n for _, nm in run_list for n in nm}, key=name_key)
+    all_names = sorted({n for _, nm, _ in run_list for n in nm}, key=name_key)
     D = len(all_names)
-    emb = [embed(a, nm, all_names) for a, nm in run_list]
+    emb = [(*embed(a, nm, all_names), f, 0) for a, nm, f in run_list]
     print(f"\n===== {tag}: {len(run_list)} runs, {sum(len(e[0]) for e in emb)} frames, "
           f"{D} dihedral columns (union) =====")
 
     def stack(parts):
         deg = np.concatenate([p[0] for p in parts])
         pres = np.concatenate([np.repeat(p[1][None, :], len(p[0]), 0) for p in parts])
-        return deg, pres
+        run = np.concatenate([np.full(len(p[0]), Path(p[2]).parent.name or Path(p[2]).name, dtype=object) for p in parts])
+        t_ps = np.concatenate([(np.arange(len(p[0]))+p[3])*STRIDE*dt for p in parts])
+        return deg, pres, run, t_ps
 
     mode = SPLIT_MODE
     if mode == "auto":
@@ -180,13 +184,13 @@ def experiment(run_list, tag):
         tr_parts = [emb[i] for i in idx[n_test:]]
     else:  # time
         tr_parts, te_parts = [], []
-        for deg, pres in emb:
+        for deg, pres, f, _ in emb:
             cut = int(len(deg) * (1 - TEST_FRAC))
-            tr_parts.append((deg[:max(cut - TIME_GAP_FRAMES // STRIDE, 1)], pres))
-            te_parts.append((deg[cut:], pres))
+            tr_parts.append((deg[:max(cut - TIME_GAP_FRAMES // STRIDE, 1)], pres, f, 0))
+            te_parts.append((deg[cut:], pres, f, cut))
     print("split mode:", mode)
-    tr_deg, tr_pres = stack(tr_parts)
-    te_deg, te_pres = stack(te_parts)
+    tr_deg, tr_pres, _, _ = stack(tr_parts)
+    te_deg, te_pres, te_run, te_t = stack(te_parts)
     print(f"train frames {len(tr_deg)}, test frames {len(te_deg)}")
 
     Xtr, Xte = to_cos_sin(tr_deg), to_cos_sin(te_deg)
@@ -212,6 +216,15 @@ def experiment(run_list, tag):
             e = masked_err(from_cos_sin(reconstruct(m, Xte) * Mte))
             sweep[latent] = e
             v = e[~np.isnan(e)]
+            torch.save({
+                "state_dict": {k: v.cpu() for k, v in m.state_dict().items()},  # CPU tensors, loadable anywhere
+                "latent": latent,
+                "n_in": Xtr.shape[1],
+                "hidden": HIDDEN,
+                "all_names": all_names,  # column order the model expects
+                "stride": STRIDE,
+                "epochs": EPOCHS,
+            }, out / f"ae_dih_l{latent}.pt")
             print(f"=> latent {latent:3d}: mean {v.mean():.2f}  median {np.median(v):.2f}  "
                   f"p95 {np.percentile(v, 95):.2f}  p99 {np.percentile(v, 99):.2f}\n")
 
@@ -232,24 +245,16 @@ def experiment(run_list, tag):
             err = masked_err(from_cos_sin(reconstruct(m, Xte) * Mte))
         flat = err[~np.isnan(err)]
         bins = np.linspace(0, 180, 91)
-        fig, ax = plt.subplots(1, 3, figsize=(17, 4.6))
-        ax[0].hist(base_err[~np.isnan(base_err)], bins=bins, density=True, alpha=0.45, color="gray",
+        fig, ax = plt.subplots(1, 1, figsize=(7,7))
+        ax.hist(base_err[~np.isnan(base_err)], bins=bins, density=True, alpha=0.45, color="gray",
                    label=f"baseline ({np.nanmean(base_err):.1f}°)")
         for l, c in zip([min(sweep), LATENT_DETAIL, max(sweep)], ["tab:orange", "tab:blue", "tab:green"]):
             if l in sweep:
                 v = sweep[l][~np.isnan(sweep[l])]
-                ax[0].hist(v, bins=bins, density=True, histtype="step", lw=1.8, color=c,
+                ax.hist(v, bins=bins, density=True, histtype="step", lw=1.8, color=c,
                            label=f"AE latent {l} ({v.mean():.1f}°)")
-        ax[0].set(xlabel="absolute angular error (deg)", ylabel="density", title="All test values")
-        ax[0].legend(fontsize=8)
-        fe = np.nanmean(err, 1)
-        ax[1].hist(fe, bins=80, color="tab:green", alpha=0.85)
-        ax[1].axvline(np.nanmedian(fe), color="k", ls="--", label=f"median {np.nanmedian(fe):.1f}°")
-        ax[1].set(xlabel="mean error per frame (deg)", ylabel="frames", title=f"Per-frame (latent {LATENT_DETAIL})")
-        ax[1].legend()
-        ax[2].hist(flat, bins=bins, color="tab:red", alpha=0.85)
-        ax[2].set_yscale("log")
-        ax[2].set(xlabel="absolute angular error (deg)", ylabel="count (log)", title="Tail")
+        ax.set(xlabel="absolute angular error (deg)", ylabel="density", title="All test values")
+        ax.legend(fontsize=8)
         fig.tight_layout()
         fig.savefig(out / "error_histograms.png", dpi=150)
 
@@ -263,9 +268,84 @@ def experiment(run_list, tag):
         fig.tight_layout()
         fig.savefig(out / "error_per_dihedral.png", dpi=150)
 
-        print(f"latent {LATENT_DETAIL}: median {np.median(flat):.2f}°  mean {flat.mean():.2f}°  "
-              f"p95 {np.percentile(flat, 95):.2f}°  p99 {np.percentile(flat, 99):.2f}°")
-        print("worst dihedrals:", [all_names[i] for i in order[:5]])
+        def frame_analysis(sweep, te_run, te_t, all_names, out, hump=16.0, top_pct=99, n_worst_runs=4):
+            latents = sorted(sweep)
+            names_arr = np.array(all_names)
+
+            # one row per test frame, one error column per latent size
+            df = pd.DataFrame({"run": te_run, "t_ns": te_t / 1000.0,
+                               "n_dihedrals": (~np.isnan(sweep[latents[0]])).sum(1)})
+            for l in latents:
+                df[f"err_L{l}"] = np.nanmean(sweep[l], 1)
+            df.to_csv(out / "frame_errors_all_latents.csv", index=False)
+            cols = [f"err_L{l}" for l in latents]
+
+            # ---- per latent: worst frames, hump, dihedrals behind the worst 1% ----
+            top_masks = {}
+            for l in latents:
+                e, c = sweep[l], f"err_L{l}"
+                print(f"\n================ latent {l} ================")
+                worst = df.sort_values(c, ascending=False).head(20).copy()
+                rows = np.nan_to_num(e[worst.index.values], nan=-1)
+                worst["worst_3_dihedrals"] = [", ".join(names_arr[np.argsort(r)[::-1][:3]]) for r in rows]
+                print(worst[["run", "t_ns", c, "worst_3_dihedrals"]].to_string(index=False))
+
+                h = df[df[c] > hump]
+                print(f"\n{len(h) / len(df):.1%} of frames above {hump} deg; top runs there:\n"
+                      f"{h['run'].value_counts().head(8)}")
+
+                top = df[c].values >= np.nanpercentile(df[c].values, top_pct)
+                top_masks[l] = top
+                extra = pd.Series(np.nanmean(e[top], 0) - np.nanmean(e, 0), index=all_names).sort_values(
+                    ascending=False)
+                print(f"\ndihedrals that are extra bad in the worst {100 - top_pct}% of frames:\n{extra.head(10)}")
+
+            # ---- per run: error for every latent side by side ----
+            per_run = df.groupby("run")[cols].mean()
+            per_run["n_dih"] = df.groupby("run")["n_dihedrals"].first()
+            per_run["frames"] = df.groupby("run").size()
+            per_run = per_run.sort_values(cols[-1], ascending=False)
+            per_run.to_csv(out / "per_run_error_all_latents.csv")
+            print("\nper-run mean error (worst 15 by the largest latent):\n", per_run.head(15).round(2).to_string())
+            print("\nmean error by number of dihedrals:\n", df.groupby("n_dihedrals")[cols].mean().round(2).to_string())
+
+            # ---- do different latent sizes fail on the same frames? ----
+            ov = pd.DataFrame(index=latents, columns=latents, dtype=float)
+            for a in latents:
+                for b in latents:
+                    inter = (top_masks[a] & top_masks[b]).sum()
+                    ov.loc[a, b] = inter / max((top_masks[a] | top_masks[b]).sum(), 1)
+            print(f"\noverlap (Jaccard) of the worst {100 - top_pct}% frames between latent sizes:\n",
+                  ov.round(2).to_string())
+
+            # ---- error vs time in the worst runs, one line per latent ----
+            worst_runs = df.groupby("run")[cols].mean().mean(1).sort_values(ascending=False).index[:n_worst_runs]
+            fig, axs = plt.subplots(len(worst_runs), 1, figsize=(11, 2.8 * len(worst_runs)), sharex=False,
+                                    squeeze=False)
+            for ax, r in zip(axs[:, 0], worst_runs):
+                d = df[df.run == r]
+                for l in latents:
+                    ax.plot(d.t_ns, d[f"err_L{l}"], lw=0.8, label=f"latent {l}")
+                ax.set(ylabel="deg", title=f"run {r}")
+            axs[0, 0].legend(fontsize=7, ncol=len(latents))
+            axs[-1, 0].set_xlabel("time (ns)")
+            fig.suptitle("Mean error per frame over time, all latent sizes")
+            fig.tight_layout()
+            fig.savefig(out / "worst_runs_error_vs_time_all_latents.png", dpi=150)
+
+            # ---- error histogram of frame errors, all latents on one axis ----
+            fig, ax = plt.subplots(figsize=(7, 4))
+            hi = max(np.nanmax(df[c]) for c in cols)
+            b = np.linspace(0, hi, 80)
+            for l in latents:
+                ax.hist(df[f"err_L{l}"].dropna(), bins=b, histtype="step", lw=1.5, label=f"latent {l}")
+            ax.set(xlabel="mean error per frame (deg)", ylabel="frames", title="Per-frame error, all latent sizes")
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(out / "per_frame_hist_all_latents.png", dpi=150)
+            return df, per_run
+
+        df_frames, per_run = frame_analysis(sweep, te_run, te_t, all_names, out)
 
 
 # ---------------------------------------------------------------------
@@ -281,10 +361,10 @@ for f in files:
         raise ValueError(f"{f}: {a.shape[1]} data columns but {len(nm)} header names")
     if np.isnan(a).any():
         raise ValueError(f"{f}: contains NaN")
-    runs.append((a, nm))
+    runs.append((a, nm, f))
 
 counts = {}
-for _, nm in runs:
+for _, nm, _ in runs:
     counts[len(nm)] = counts.get(len(nm), 0) + 1
 print(f"{len(runs)} runs; dihedral counts per run: {dict(sorted(counts.items()))}")
 
@@ -292,8 +372,8 @@ if GROUP_MODE == "pad":
     experiment(runs, "all_runs_padded")
 else:
     groups = {}
-    for a, nm in runs:
-        groups.setdefault(tuple(nm), []).append((a, nm))
+    for a, nm, f in runs:
+        groups.setdefault(tuple(nm), []).append((a, nm,f))
     for k, (hdr, rl) in enumerate(sorted(groups.items(), key=lambda kv: -len(kv[1]))):
         if len(rl) < MIN_RUNS_PER_GROUP:
             print(f"skip group with {len(rl)} run(s), {len(hdr)} dihedrals")

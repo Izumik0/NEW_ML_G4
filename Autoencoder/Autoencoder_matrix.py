@@ -1,4 +1,6 @@
 import os
+import sys
+
 import numpy as np, pandas as pd
 import matplotlib.pyplot as plt
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -11,7 +13,7 @@ CSV = '../lifetimes_data_simple.csv'
 NPZ_DIR = Path('../distance_matrix-kopia/')
 Cache_dir = Path('cache'); Cache_dir.mkdir(exist_ok=True)
 NPZ_key = None
-Store_DTYPE = np.float16
+Store_DTYPE = np.float32
 Include_C=False
 
 
@@ -40,6 +42,12 @@ elif torch.backends.mps.is_available():
 else:
     device = torch.device('cpu')
 
+if (device.type=='cuda' and sys.platform.startswith("linux")):
+    nw=4
+else:
+    nw=0
+
+print(f'Selected divice: {device}')
 torch.manual_seed(SEED)
 rng = np.random.default_rng(SEED)
 IU = np.triu_indices(N,k=1)
@@ -188,7 +196,7 @@ def eval(model, latent, with_pca=True,map_rows=None):
     enc, pca, zs = [], {L:[] for L in Latents}, []
     emap, nmap = torch.zeros(N,N,device=device), 0
     held_rows = torch.from_numpy((df.split=="holdout").values)
-    for x, k , p in DataLoader(Frames(paths, eval_items, SCALE), batch_size=Batch, num_workers=0):
+    for x, k , p in DataLoader(Frames(paths, eval_items, SCALE), batch_size=Batch, num_workers=nw, pin_memory=(device.type=='cuda')):
         xd=x.to(device)
         out=model(xd)[0]
         enc.append(recon_loss(out, xd).cpu())
@@ -226,6 +234,56 @@ for i, L in enumerate(Latents):
         np.save(Out / "error_map.npy", r["map"])
     torch.save({"model": model.state_dict(), "scale": SCALE}, Out / f"ae_L{L}.pt")
 meta.to_csv(Out / "frame_errors.csv.gz", index=False)
+
+NB, XMAX, STEP = 100, 1.0, 5       # bins, largest error drawn, use every 5th test frame
+UNIT = "nm"
+edges = np.linspace(0, XMAX, NB + 1); width = edges[1] - edges[0]
+
+models = {}
+for L in Latents:
+    ck = torch.load(Out / f"ae_L{L}.pt", map_location=device)
+    m = ConvEncoder(L).to(device); m.load_state_dict(ck["model"]); models[L] = m.eval()
+
+subsets = ["all", "holdout"]
+acc = {(n, s): dict(h=torch.zeros(NB, dtype=torch.float64), s=0.0, n=0)
+       for n in ["baseline"] + Latents for s in subsets}
+held_rows = torch.from_numpy(np.array((df.split == "holdout").values))
+
+def add(n, s, err):                          # err: 1-D CPU tensor of absolute errors
+    a = acc[(n, s)]
+    a["h"] += torch.histc(err, bins=NB, min=0, max=XMAX).double()
+    a["s"] += err.double().sum().item(); a["n"] += err.numel()
+
+sub = eval_items[::STEP]
+with torch.no_grad():
+    for b, (x, k, p) in enumerate(DataLoader(Frames(paths, sub, SCALE), batch_size=64, num_workers=nw, pin_memory=(device.type == "cuda"))):
+        xd = x.to(device)
+        xt = x[:, 0, IU_T[0], IU_T[1]]                           # scaled upper triangle (CPU)
+        errs = {"baseline": (xt - MU).abs() * SCALE}
+        for L, m in models.items():
+            out = m(xd)[0][:, 0, IU_T[0], IU_T[1]].cpu()
+            errs[L] = (out - xt).abs() * SCALE
+        is_h = held_rows[k]
+        for n, e in errs.items():
+            add(n, "all", e.flatten())
+            if is_h.any():
+                add(n, "holdout", e[is_h].flatten())
+        if b % 100 == 0:
+            print(f"batch {b}", flush=True)
+
+fig, axs = plt.subplots(1, 2, figsize=(14, 6.5))
+cols = plt.cm.viridis(np.linspace(0, 0.9, len(Latents)))
+for ax, s, title in zip(axs, subsets, ["All test values", "Held-out sequences only"]):
+    a = acc[("baseline", s)]
+    ax.bar(edges[:-1], a["h"].numpy() / a["n"] / width, width=width, align="edge", color="0.75",
+           label=f"baseline, mean structure ({a['s'] / a['n']:.3f} {UNIT})")
+    for L, c in zip(Latents, cols):
+        a = acc[(L, s)]
+        ax.stairs(a["h"].numpy() / a["n"] / width, edges, color=c, lw=1.8,
+                  label=f"AE latent {L} ({a['s'] / a['n']:.3f} {UNIT})")
+    ax.set(title=title, xlabel=f"absolute distance error ({UNIT})", ylabel="density")
+    ax.legend(fontsize=8)
+fig.tight_layout(); fig.savefig(Out / "error_histograms.png", dpi=150)
 
 # %% summary table
 rows = []
@@ -275,6 +333,6 @@ fig.savefig(Out / "error_map.png", dpi=150)
 # error by condition: is information lost more for some topologies / layouts?
 by = meta.groupby(["lay", "top"])[col].mean().pipe(lambda s: np.sqrt(s) * SCALE).rename("rmse_nm")
 by.sort_values().to_csv(Out / "rmse_by_condition.csv")
-plt.show()
+
 
 

@@ -24,6 +24,34 @@
             </Attribute>
           </value>
         </entry>
+        <entry key="/Autoencoder_results_matrix/summary.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/dihedral_ae_out_stream/all_runs_streamed/frame_errors_all_latents.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/dihedral_ae_out_stream/all_runs_streamed/per_run_error_all_latents.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/lifetimes_data_simple.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
         <entry key="\Autoencoder_results_v2\rmse_by_condition.csv">
           <value>
             <Attribute>

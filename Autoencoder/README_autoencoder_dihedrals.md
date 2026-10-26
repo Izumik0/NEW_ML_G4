@@ -1,48 +1,54 @@
-# Dihedral Autoencoder: Is the Backbone Dihedral Data Worth Anything?
+# Dihedral Autoencoder (`Autoencoder_dihedral.py`)
 
-An autoencoder (AE) test for G-quadruplex (G4) molecular-dynamics trajectories. It answers one question:
-
-> **Do the backbone dihedral angles contain structured, compressible information, so that a small number of latent variables can reconstruct them?**
-
-If an AE with a latent code of, say, 8 numbers can rebuild ~100 dihedral angles with a small error, the data has low effective dimensionality and real structure. If the AE barely beats a trivial "predict the average" baseline, the dihedrals are mostly noise (or the model is too weak or undertrained).
+Main question to which we are looking for answear is:
+> **Do the backbone dihedral angles carry compressible structure, so that a small latent code can reconstruct them?**
 
 ---
 
 ## Contents
 
 1. [Quick start](#1-quick-start)
-2. [Input data format](#2-input-data-format)
-3. [How the pipeline works](#3-how-the-pipeline-works)
-4. [The model](#4-the-model)
-5. [Train/test splits](#5-traintest-splits)
-6. [Metrics](#6-metrics)
-7. [Output files](#7-output-files)
-8. [How to interpret the results](#8-how-to-interpret-the-results)
-9. [Configuration reference](#9-configuration-reference)
-10. [Saving and inspecting model weights](#10-saving-and-inspecting-model-weights)
-11. [Caveats and limitations](#11-caveats-and-limitations)
-12. [Troubleshooting](#12-troubleshooting)
+2. [Input data](#2-input-data)
+3. [How it works](#3-how-it-works)
+4. [Memory, disk and time](#4-memory-disk-and-time)
+5. [Configuration reference](#5-configuration-reference)
+6. [Output files](#6-output-files)
+7. [Interpreting the results](#7-interpreting-the-results)
+8. [Resuming and re-running](#8-resuming-and-re-running)
+9. [Saved models](#9-saved-models)
+10. [Limitations](#10-limitations)
+11. [Troubleshooting](#11-troubleshooting)
 
 ---
 
 ## 1. Quick start
 
-Requirements: Python 3.10+, `numpy`, `pandas`, `matplotlib`, `torch` (the script picks MPS on Apple Silicon, CUDA if available, otherwise CPU).
+Requirements: Python 3.10+, `numpy`, `pandas`, `matplotlib`, `torch`. The script uses MPS (Apple GPU), CUDA, or CPU, whichever is available.
 
-1. Edit the **CONFIG** block at the top of the script (`DATA_GLOB`, `STRIDE`, `dt`, `EPOCHS`, `LATENT_SWEEP`).
-2. **Smoke test first**: set `EPOCHS = 5`, `LATENT_SWEEP = [8]`, `STRIDE = 50`. This checks that data loading, masking and plotting work. The errors at 5 epochs are not scientific results.
-3. Run the full experiment: `EPOCHS = 40–60`, `LATENT_SWEEP = [2, 4, 8, 16, 32, 64]`.
-4. Open the figures and CSVs in `OUT_DIR/all_runs_padded/`.
+1. Set parameters for your data in CONFIG section
+2. **Smoke test first** (a few minutes): set
+
+   ```python
+   MAX_TRAIN_FRAMES = 2_000_000
+   MAX_TEST_FRAMES  = 100_000
+   LATENT_SWEEP     = [8]
+   ```
+
+   This checks the data path, the GPU backend and the plots. Results from this run are not scientific (because it is just testing if script works for your data).
+   And this tell you how to exacly config script to train it on your data.
+3. Look at the printed `frames/s` and `ETA` lines during training (see [section 5](#5-memory-disk-and-time)) and choose `MAX_TRAIN_FRAMES` so the whole sweep fits your time budget.
+4. Run the full sweep. The first run also builds the cache, which is the slowest step, and it can be interrupted and restarted.
 
 ```bash
 python Autoencoder_dihedral.py
 ```
 
+
 ---
 
-## 2. Input data format
+## 2. Input data
 
-One text file per simulation run (e.g. `dihedrals/<run>/bb_dihedrals.txt`):
+One text file per run, for example `dihedrals/<run>/bb_dihedrals.txt`:
 
 ```
 #      time      b1      g1      d1      e1      z1      a2  ...
@@ -50,272 +56,289 @@ One text file per simulation run (e.g. `dihedrals/<run>/bb_dihedrals.txt`):
       20.00 -174.84   71.41  153.96 -179.85  -85.91  -62.66  ...
 ```
 
-- The first line starts with `#` and lists the column names. The first name is `time`.
-- Every following line is one frame. The first number is time (ps), the rest are dihedral angles **in degrees**, in (−180, 180].
-- Frame spacing is **20 ps** (`dt = 20.0` in the config).
-- Column names are a letter plus a residue number: `a` = α, `b` = β, `g` = γ, `d` = δ, `e` = ε, `z` = ζ. For example `g15` is γ of residue 15.
-- **Runs may have different numbers of dihedrals** (different sequences or lengths). The script handles that (see [padding and masking](#padding-and-masking)).
-- No NaNs are allowed. The script raises an error if it finds any.
-
-`time` is dropped on loading. A time axis is rebuilt later as `(frame index) × STRIDE × dt`.
-
-Parsed files are cached as `.npy` in `CACHE_DIR`. **Delete the cache whenever you change `STRIDE` or replace the source files** (the stride is part of the cache file name, but changed source data is not detected).
+- The first line starts with `#` and lists column names, the first being `time`.
+- Every other line is a frame: time in ps, then dihedral angles **in degrees**.
+- Names are letter + residue number (`a` = α, `b` = β, `g` = γ, `d` = δ, `e` = ε, `z` = ζ).
+- **Runs may have different dihedral sets.** The union of all names defines the columns; missing entries are padded and masked (see section 4.3).
+- The **run label** in tables and plots is the name of the file's folder (`Path(file).parent.name`). Make sure the folder names are unique, or runs with the same name will be merged in the per-run tables (the script prints a warning).
 
 ---
 
-## 3. How the pipeline works
+## 3. How it works
 
 ```
- .txt files ──► load + stride ──► align columns by name (union) ──► split ──► cos/sin ──► AE ──► decode
-                                                                                              │
- error figures ◄── angular error (degrees, wrap-safe) ◄── arctan2(sin, cos) ◄─────────────────┘
+ .txt files ─► cache (.npy, every STRIDE-th frame, parallel) ─► segments (SEG_LEN frames)
+                                                                   │
+        train: shuffle segments ─► load block (~BLOCK_FRAMES) ─► shuffle frames ─► batches ─► AE
+        test : fixed order      ─► load block ─► reconstruct ─► accumulate statistics ─► discard block
 ```
 
-### 3.1 Why cos/sin and not raw angles
+### 3.1 Cache
 
-A dihedral is a circular quantity: −179° and +179° are only 2° apart, but numerically they are 358 apart. Feeding raw degrees to a network creates an artificial discontinuity at ±180°, and an MSE loss would heavily punish a reconstruction that is physically almost perfect.
+Each run is parsed once into `CACHE_DIR/<path>_s<STRIDE>.npy` (float32 degrees, shape `(frames, dihedrals)`, time column removed).
 
-Each angle θ is therefore replaced by two numbers, **cos θ and sin θ**. Both lie in [−1, 1], the representation is continuous around the circle, and no angle is privileged. For D dihedral columns the network input has **2D** values, arranged as `[cos₁ … cos_D | sin₁ … sin_D]`.
+- The parser reads only every `STRIDE`-th line, so a large stride is also fast to build. For `STRIDE = 1` the whole text must be parsed once.
+- Files are written to a temporary name and renamed when complete, so an interruption cannot leave a half-written cache file. A cache file that fails to load is detected and rebuilt.
+- Cache files are reused only if the **file path and `STRIDE` are identical**. They are **not** refreshed if you edit a source `.txt`; delete the matching `.npy` yourself.
+- Cache files made by earlier versions of the in-memory script have the same format and are reused.
 
-To get an angle back, the script computes `θ = atan2(sin, cos)`. This tolerates network outputs that are not exactly unit-length, because only the direction matters.
+### 3.2 Segments and blocks
 
-### 3.2 Padding and masking
+Every run is cut into **segments** of `SEG_LEN` consecutive frames. A segment is the unit of disk access (one contiguous read of roughly 1 MB).
 
-Runs with different dihedral sets are combined by taking the **union of all column names** (sorted by residue, then by α, β, γ, δ, ε, ζ):
+- **Training:** the segment list is shuffled, segments are collected until `BLOCK_FRAMES` frames are gathered, the block is loaded into RAM, its frames are shuffled, and the model trains on batches from it. Then the block is dropped. Because a block mixes segments from many different runs, batches are diverse even though each segment is contiguous in time.
+- **Prefetching:** a background thread loads the next block while the GPU trains on the current one.
+- **Testing:** segments are visited in a fixed order, so the same test frames appear in the same order for the baseline and for every latent size. That is what makes per-frame comparisons between latent sizes possible.
 
-- A run that has a column keeps its real data there.
-- A run that lacks a column gets zeros there (cos = sin = 0, which is not a valid angle) and a **mask** value of 0.
-- The loss is computed **only over mask = 1 entries**, so the model is never rewarded or punished for padding.
-- All error statistics skip masked entries (they are NaN internally and ignored with `nanmean`/`nanmedian`).
+### 3.3 cos/sin encoding, padding and masking
 
-This means padded zeros can never make the error look better than it is.
+- Each angle θ is replaced by `cos θ` and `sin θ`, so the input has `2D` values (`D` = number of columns in the union). This removes the artificial jump at ±180°. Angles are recovered with `atan2(sin, cos)`.
+- Missing dihedrals get zeros and a **mask** of 0. The loss and all error statistics ignore masked entries, so padding can never improve the apparent accuracy.
+- **Alignment is by column name.** `g15` in one run is assumed to be the same structural dihedral as `g15` in another. This is valid when runs differ only by missing or extra residues at the ends. If the same residue number means something different between runs, interpret results per group of identical headers instead (this script does not have a group mode; use the in-memory script's `GROUP_MODE = "group"` for that).
 
-> **Important:** alignment is by column *name*. `g15` in one run is assumed to be structurally the same dihedral as `g15` in another run. That is true if the runs differ only by missing or extra end residues. If the runs are different sequences or topologies where the same residue number means something different, use `GROUP_MODE = "group"`, which trains a separate AE for each identical header set.
+### 3.4 The model
 
-### 3.3 Stride
+```
+Encoder:  2D ─► 256 ─► 128 ─► latent        (GELU between layers)
+Decoder:  latent ─► 128 ─► 256 ─► 2D        (GELU between layers, Tanh output)
+```
 
-`STRIDE = N` keeps every N-th frame. With `dt = 20 ps`, `STRIDE = 5` gives 100 ps spacing and `STRIDE = 50` gives 1 ns. Neighbouring 20 ps frames are nearly identical, so a larger stride makes the dataset smaller and faster without losing much information. It also makes the test frames less correlated with one another.
+Masked mean squared error on the cos/sin values, AdamW, cosine learning-rate decay over the whole training budget (stepped per batch).
+
+### 3.5 Training budget
+
+Instead of epochs, each model sees a fixed number of frames:
+
+```
+budget = min(TRAIN_PASSES × n_train_frames, MAX_TRAIN_FRAMES)
+steps  = budget // BATCH_SIZE
+```
+
+`TRAIN_PASSES` can be fractional (for example 0.2 sees a random 20% of the segments' worth of frames). A single pass over hundreds of millions of frames is already a very large amount of training: neighbouring frames are almost identical, so repeating the data many times adds little.
+
+### 3.6 Splits
+
+| Mode | Behaviour |
+|---|---|
+| `"auto"` | `"run"` if there are at least 5 runs, otherwise `"time"` |
+| `"run"` | `TEST_FRAC` of the **runs** go to the test set; the rest train. Preferred: it tests generalisation to unseen simulations. |
+| `"time"` | The last `TEST_FRAC` of every run is test, after a gap of `TIME_GAP_FRAMES` (original frames) so train and test do not touch. |
+| `"all"` | Train and test on everything. Only a compressibility check; says nothing about generalisation. |
+
+Never split by random frame: it can cause a leak in model training
+
+### 3.7 Baseline
+
+The baseline predicts, for every dihedral, the mean cos and mean sin of the training data. It is estimated from a random `BASELINE_FRAC` of the training segments. An autoencoder only shows structure if it clearly beats this.
+
+### 3.8 Evaluation
+
+Test frames are processed in batches of `EVAL_BATCH`. For each frame the script computes the wrap-safe absolute angular error per dihedral:
+
+```
+err = | ((pred − true + 180) mod 360) − 180 |      (179° vs −179° → 2°)
+```
+
+and accumulates, without storing the error matrix:
+
+- a histogram of all individual errors (0.25° bins),
+- a histogram of per-frame mean errors (0.25° bins),
+- per-dihedral error sums, split by per-frame error bin (this gives "which dihedrals are bad in the worst frames"),
+- per-run error sums,
+- the 20 worst frames with their per-dihedral errors,
+- per-frame arrays (error, run, time) for the evaluated frames, used for CSVs and the time plots.
+
+**Which test frames are evaluated.** If the test set has more than `MAX_TEST_FRAMES` frames, every `test_every`-th frame is evaluated (`test_every = ceil(n_test / MAX_TEST_FRAMES)`), evenly across all test runs. **All statistics and plots in the output describe these evaluated frames.** Set `MAX_TEST_FRAMES` higher to evaluate more; memory for the per-frame arrays is about 16 bytes per evaluated frame per latent size.
+
+The mean error is exact. Median, p95 and p99 come from the 0.25° histograms and are accurate to about a quarter of a degree.
 
 ---
 
-## 4. The model
+## 4. Memory, disk and time
 
-A fully connected autoencoder with a bottleneck.
+### RAM
+
+At startup the script prints an estimate. The main consumer is the block:
 
 ```
-Encoder:  2D ──► 256 ──► 128 ──► latent
-              GELU    GELU
-Decoder:  latent ──► 128 ──► 256 ──► 2D
-                  GELU    GELU    Tanh
+block ≈ BLOCK_FRAMES × D × 4 bytes        (D = union column count)
 ```
 
-- **Input / output size 2D**, where D is the number of columns in the union (including padded ones).
-- **Latent size** is the bottleneck. It is the number being swept (`LATENT_SWEEP`). It is the number of values used to describe one frame.
-- **GELU** hidden activations: smooth, avoids dead units, a sensible default for smooth inputs like cos/sin. ReLU or SiLU would probably give similar results.
-- **Tanh output**: cos and sin lie in [−1, 1], so the decoder is bounded to the same range.
-- **Loss:** masked mean squared error on the cos/sin values, `sum(mask · (x̂ − x)²) / sum(mask)`.
-- **Optimizer:** AdamW, learning rate `LR`, cosine-annealed to zero over `EPOCHS`.
+For `D ≈ 115` and `BLOCK_FRAMES = 1,000,000` a block is about 0.46 GB. Several exist at once (the one being used, its copy on the device, and up to two prefetched), so plan for roughly 2–4 GB plus the per-frame evaluation arrays. This does not grow with the amount of data. Lower `BLOCK_FRAMES` to reduce it; very small blocks mix fewer runs per batch.
 
-The AE is intentionally small and plain. The question is about the data, not about finding the best architecture.
+On Apple Silicon the GPU shares system memory, so device copies count against the same RAM.
+
+### Disk
+
+The cache holds float32 values, roughly half the size of the text files (4 bytes per value instead of about 8–9 characters; this is an estimate from the file format). You need space for both the text files and the cache. Caches for different `STRIDE` values coexist and are never deleted automatically.
+
+The OS may use free RAM as a file cache for the memory-mapped files. That memory is released automatically when needed and is not a leak.
+
+### Time
+
+The costs are:
+
+1. **First cache build:** one-time. It reads all text from disk and parses every `STRIDE`-th line, using `N_WORKERS` processes.
+2. **Training:** `budget / frames_per_second` per latent size. During training the script prints lines like
+
+   ```
+   step 1,200/48,000  loss 0.01834  210,000 frames/s  ETA 31.4 min
+   ```
+
+   The figures are measured on your machine. Total training time is about `(ETA per model) × number of latent sizes`. Choose `MAX_TRAIN_FRAMES` from that.
+3. **Evaluation:** runs on the CPU in NumPy and is roughly proportional to the number of evaluated frames. It is small next to training when `MAX_TEST_FRAMES` is around a million.
+
+If frames/s is lower than you expect, the usual causes are a disk that cannot keep up with block loading (try an SSD, a smaller `STRIDE` range, or a larger `SEG_LEN`) or a small `BATCH_SIZE`.
 
 ---
 
-## 5. Train/test splits
+## 5. Configuration reference
 
-`SPLIT_MODE` controls what the model is tested on. Test error is always measured on data the model did not train on, except in `"all"` mode.
-
-| Mode | What it does | Use when |
-|------|--------------|----------|
-| `"run"` | Whole runs go to train or test (`TEST_FRAC` of the runs). | **Preferred** with 5+ runs. Tests generalisation to unseen simulations. |
-| `"time"` | The last `TEST_FRAC` of every run is test; a gap of `TIME_GAP_FRAMES` is dropped before it. | Few runs (e.g. one file). Tests generalisation to later parts of the same trajectory. |
-| `"all"` | Train and test on everything. | A pure compressibility check ("is information conserved through the bottleneck?"). It says nothing about generalisation. |
-| `"auto"` | `"run"` if there are at least 5 runs, else `"time"`. | Default. |
-
-**Never split randomly by frame.** Frames 20 ps apart are almost identical, so a random frame split leaks the test set into training and makes the results look much better than they are.
-
-`TIME_GAP_FRAMES` is in original 20 ps frames and is divided by `STRIDE` internally.
-
----
-
-## 6. Metrics
-
-All errors are reported in **degrees** after converting the reconstruction back with `atan2`.
-
-**Wrap-safe angular error**
-
-```
-err = | ((pred − true + 180) mod 360) − 180 |
-```
-
-So the error between 179° and −179° is 2°, not 358°. The maximum possible error is 180°.
-
-**Baseline ("predict the mean")**
-
-For every dihedral, the mean cos and mean sin over the training set are computed, and every frame is "reconstructed" as that constant. This is the error you get from knowing nothing about each frame. An autoencoder only demonstrates structure if it clearly beats this.
-
-**Reported statistics:** mean, median, 95th and 99th percentile over all test values. The median is the typical error; the mean is pulled up by rare large errors; the percentiles describe the tail.
+| Setting | Example                           | Meaning |
+|---|-----------------------------------|---|
+| `DATA_GLOB` | `../dihedrals/*/bb_dihedrals.txt` | Pattern for the run files. |
+| `STRIDE` | `1`                               | Keep every N-th original frame. `1` = whole data. Part of the cache file name. |
+| `dt` | `20.0`                            | Time between original frames (ps). Used only for the time axis: `t = frame_index × STRIDE × dt`. |
+| `CACHE_DIR` | `cache_dihedrals`                 | Where parsed `.npy` files go. |
+| `N_WORKERS` | CPU count − 2                     | Parallel parsing processes (first pass only). |
+| `SPLIT_MODE` | `"auto"`                          | `"auto"`, `"run"`, `"time"` or `"all"`. |
+| `TEST_FRAC` | `0.2`                             | Fraction of runs (run mode) or of each run's end (time mode) used as test. |
+| `TIME_GAP_FRAMES` | `100`                             | Time mode: gap in original frames before the test part. |
+| `LATENT_SWEEP` | `[2, 4, 8, 16, 32, 64]`           | Latent sizes to train and compare. |
+| `LATENT_DETAIL` | `8`                               | Latent size used for the detailed plots (the nearest swept size is used if it is not in the sweep). |
+| `HIDDEN` | `(256, 128)`                      | Hidden layer widths. |
+| `BATCH_SIZE` | `2048`                            | Training batch size. |
+| `LR` | `2e-3`                            | AdamW learning rate. |
+| `TRAIN_PASSES` | `1.0`                             | Passes over the training frames per model (may be fractional). |
+| `MAX_TRAIN_FRAMES` | `100,000,000`                     | Hard cap on frames seen per model. |
+| `SEG_LEN` | `2048`                            | Contiguous frames per segment. |
+| `BLOCK_FRAMES` | `1,000,000`                       | Frames held in RAM at once. |
+| `EVAL_BATCH` | `16384`                           | Evaluation batch size. |
+| `MAX_TEST_FRAMES` | `1,000,000`                       | Upper bound on evaluated test frames (frames are thinned evenly beyond this). |
+| `BASELINE_FRAC` | `0.1`                             | Share of training segments used for the baseline mean. |
+| `HUMP` | `16.0`                            | Per-frame error (deg) used to split "good" and "bad" frames in the analysis. Adjust it to the valley between the two humps in your own histogram. |
+| `TOP_PCT` | `99`                              | "Worst frames" = above this percentile of per-frame error. |
+| `N_WORST_RUNS` | `4`                               | Runs shown in the error-over-time plot. |
+| `RESUME` | `True`                            | Reuse finished latent sizes whose configuration matches. |
+| `SEED` | `0`                               | Seed for initialisation, the run split and shuffling. |
+| `OUT_DIR` | `../dihedral_ae_out_stream`       | Output folder. |
 
 ---
 
-## 7. Output files
+## 6. Output files
 
-Everything is written to `OUT_DIR/all_runs_padded/` (or `groupK_…` folders in group mode).
+Everything goes to `OUT_DIR/all_runs_streamed/`.
 
 | File | Contents |
-|------|----------|
-| `error_vs_latent.png` | Mean and median test error vs latent size, with the baseline as a dotted line. |
-| `error_histograms.png` | error distribution of all values (AE vs baseline)|
-| `error_per_dihedral.png` | Mean error of each dihedral at `LATENT_DETAIL`, sorted from worst to best. |
-| `frame_errors_all_latents.csv` | One row per test frame: run, time (ns), number of dihedrals, and mean error for every latent size (`err_L2`, `err_L4`, …). |
-| `per_run_error_all_latents.csv` | Mean error of every run at every latent size, with the run's dihedral count and number of test frames. |
-| `worst_runs_error_vs_time_all_latents.png` | Error over time for the four worst runs, one line per latent size. |
+|---|---|
+| `error_vs_latent.png` | Mean and median test error against latent size, with the baseline as a dotted line. |
+| `error_histograms.png` | Three panels at `LATENT_DETAIL`: density of all errors (AE vs baseline, three latent sizes), per-frame mean error, and the log-scale tail. |
+| `error_per_dihedral.png` | Mean error of each dihedral, sorted from worst to best. |
+| `frame_errors_all_latents.csv` | One row per evaluated test frame: run, time (ns), number of dihedrals, and the per-frame mean error for every latent size (`err_L2`, `err_L4`, …). |
+| `per_run_error_all_latents.csv` | Mean error of each test run at every latent size, with its dihedral count and number of evaluated frames. |
+| `worst_runs_error_vs_time_all_latents.png` | Error over time for the worst runs, one line per latent size. |
 | `per_frame_hist_all_latents.png` | Per-frame error histograms for all latent sizes on one axis. |
-| `models/ae_latent*.pt` | Saved weights and configuration (only if checkpoint saving is added, see [section 10](#10-saving-and-inspecting-model-weights)). |
+| `models/ae_latent*.pt` | Saved weights and configuration (see section 10). |
+| `eval_baseline.pkl`, `eval_L*.pkl` | Accumulated statistics per model, used for resuming. |
 
-The console output also prints, for every latent size: the 20 worst frames with their three worst dihedrals, the share of frames in the high-error group and the runs that dominate it, the dihedrals that are most over-represented in the worst 1% of frames, per-run errors, errors grouped by number of dihedrals, and an overlap matrix of the worst frames between latent sizes.
+The console output also prints a summary table (mean, median, p95, p99 for the baseline and each latent size) and, for each latent size: the 20 worst evaluated frames with their three worst dihedrals, the share of frames above `HUMP` and the runs dominating that group, the dihedrals that are extra bad in the worst 1% of frames, per-run errors, errors grouped by number of dihedrals, and the overlap (Jaccard index) of the worst frames between latent sizes.
 
 ---
 
-## 8. How to interpret the results
+## 7. Interpreting the results
 
-### 8.1 Error vs latent size (`error_vs_latent.png`)
+### Error vs latent size
 
-This is the headline result.
+- **Gap to the baseline** is the main answer to "is the data worth anything". A large gap means the dihedrals have structure that a small code can capture.
+- A curve that **falls and then flattens** shows the effective dimensionality: beyond the flattening point extra latent variables add nothing.
+- A curve that is **flat from the first point** means either that very few degrees of freedom already explain the data, or that the remaining error is not limited by the bottleneck (thermal noise, rare flips, too little training). Include small sizes (2, 4) so the elbow is visible.
+- A curve that **keeps falling** at the largest size suggests a high-dimensional signal; extend the sweep.
+- A mean well above the median means a minority of values is reconstructed very badly (see the tail panel).
 
-- **Gap to the baseline.** The larger the gap between the AE curve and the dotted baseline line, the more structure the dihedrals have. In one early test, the baseline was about 30.6° and the AE reached about 13° with a median near 8° at latent 8–16. That means 8 numbers captured much of what ~100 angles contain. (Early-test numbers; your values depend on stride, epochs and data.)
-- **Shape of the curve.**
-  - Falls steeply, then flattens: the flattening point is the *effective dimensionality* of the data. Beyond it, more latent variables add nothing.
-  - Flat from the start (e.g. 8 and 16 give the same error): either the data already has ≤8 effective degrees of freedom, or the remaining error comes from something the bottleneck does not limit (thermal noise, rare flips, undertraining).
-  - Keeps falling at the largest latent size: the data is high-dimensional, or the AE is acting as a near-identity map. Try larger sizes.
-- **Mean above median.** Typical when a small fraction of values are reconstructed very badly. The tail panel shows how.
+### Error histograms
 
-### 8.2 Error histograms (`error_histograms.png`)
+- **All errors, AE vs baseline:** AE curves piled near 0° and far left of the grey baseline indicate real structure. Curves for different latent sizes on top of each other mean extra dimensions did not help.
+- **Per-frame error:** one peak means errors are similar across frames. **Two humps** mean a subset of frames or runs is reconstructed several times worse than the rest. Use the per-run table, the number-of-dihedrals table and the time plots to see what that subset is. Do not assume the cause.
+- **Tail (log scale):** a plateau at large errors (roughly 50°–125°) followed by a thin tail to 180° is typical of dihedrals that jump between rotamers, which the AE places on the wrong side of the circle. These are rare but raise the mean.
 
-**all values, AE vs baseline.**
-AE curves piled up near 0° and well left of the grey baseline = real structure. Curves for different latent sizes lying on top of each other = extra latent dimensions do not help.
+### Per-dihedral errors
 
-### 8.3 Error per dihedral (`error_per_dihedral.png`)
+High errors are expected for flexible backbone angles (α, γ, ζ, sometimes β and ε), loops and chain ends; low errors for δ (sugar pucker, two main states). If the worst dihedrals cluster at residue numbers that exist in only some runs, suspect fewer training examples for those columns or name-based misalignment.
 
-- **High error** is typical for the flexible backbone angles (α, γ, ζ, sometimes β and ε), especially in loops and terminal residues (chain ends fray).
-- **Low error** is typical for δ, which follows sugar pucker and has two well-defined states.
-- If the worst dihedrals cluster at **high residue numbers** that exist in only some runs, that is a sign of two possible causes: fewer training examples for those columns, or a name-alignment problem (the same name meaning different structural positions in different runs). Compare with `GROUP_MODE = "group"`.
+### Per-run and per-frame analysis
 
-### 8.4 Per-frame and per-run analysis
+- The **number-of-dihedrals table** shows whether runs with more dihedrals are harder.
+- A run whose error **does not fall** as the latent size grows is limited by something other than the bottleneck.
+- The **Jaccard overlap** of the worst frames between latent sizes: values near 1 mean the same frames are worst at every size (a structural cause: a rare conformation or flip); values near 0 mean the worst frames change with size (the bottleneck matters).
+- **Error over time** shows spikes at conformational events versus a constant offset for poorly represented runs. `frame_errors_all_latents.csv` can be joined to your lifetimes table to test whether the error rises as unfolding approaches.
 
-Use `frame_errors_all_latents.csv` and `per_run_error_all_latents.csv`.
-
-- **Worst-frames table (console):** the `worst_3_dihedrals` column. If the same dihedrals recur, the failure is localised (a flip or a flexible loop). If they vary, the errors are diffuse.
-- **Error by number of dihedrals:** if runs with more dihedrals have clearly higher error, the padded approach is a likely culprit.
-- **Overlap matrix (Jaccard) of the worst 1% frames:**
-  - Near 1: the same frames are the worst at every latent size. They are hard for a *structural* reason (a rare conformation, a flip, an unusual state) and a bigger bottleneck will not fix them.
-  - Near 0: the worst frames change with latent size, so the bottleneck matters and errors are more random.
-- **Error vs time:** a spike or step at a particular time marks a conformational event; a constantly elevated line means the whole run is poorly represented. You can join the CSV with the lifetimes table (`lifetimes_data_simple.csv`) to test whether reconstruction error rises as unfolding approaches. If it does, the error itself is informative.
-- **Per-run table across latent sizes:** a run whose error does *not* fall as the latent size grows is limited by something other than the bottleneck.
-
-### 8.5 Decision guide
+### Decision guide
 
 | Observation | Likely meaning | What to try |
-|-------------|----------------|-------------|
-| AE error ≈ baseline | Little structure, or undertrained. | More epochs, lower stride, larger latent. Check the training loss. |
-| AE error ≪ baseline, flat in latent size | Low-dimensional data, or error dominated by noise or rare flips. | Add latent sizes 2 and 4; compare to a PCA baseline and to the frame-to-frame noise floor. |
-| AE error falls steadily with latent size | High intrinsic dimension. | Extend the sweep to larger sizes; consider a deeper model. |
-| Test error ≫ train error | Overfitting or an unrepresentative split. | Use `"run"` split, more runs, regularisation. |
-| Second hump in per-frame histogram | A subset of runs or frames is poorly reconstructed. | Inspect per-run CSV and error vs time; try group mode. |
-| Same frames worst at all latent sizes | A structural cause (rare conformation, flips). | Look at those frames' dihedrals directly. |
-| Errors concentrated at high-numbered residues | Fewer examples, or name misalignment. | Group mode; check residue counts per run. |
+|---|---|---|
+| AE error ≈ baseline | Little structure, or undertrained | Check the training loss, raise `MAX_TRAIN_FRAMES`, lower `STRIDE` |
+| AE error ≪ baseline, flat in latent size | Low-dimensional data, or error from noise and rare flips | Add sizes 2 and 4; compare with a PCA baseline and the frame-to-frame noise floor |
+| Error keeps falling with latent size | High intrinsic dimension | Extend the sweep |
+| Second hump in the per-frame histogram | A subset of runs/frames is poorly reconstructed | Inspect per-run table and time plots |
+| Same worst frames at every size | A structural cause | Examine those frames' dihedrals directly |
+| Errors concentrated at high residue numbers | Fewer examples or name misalignment | Compare runs by length; check residue counts |
 
 ---
 
-## 9. Configuration reference
+## 8. Resuming and re-running
 
-| Setting | Meaning |
-|---------|---------|
-| `DATA_GLOB` | File or glob pattern for the run files. |
-| `STRIDE` | Keep every N-th frame (1 = every 20 ps). |
-| `dt` | Time between original frames in ps (20.0). Only used to build the time axis. |
-| `CACHE_DIR` | Folder for parsed `.npy` files. Delete after changing source data. |
-| `GROUP_MODE` | `"pad"` = one model with name-aligned padded columns; `"group"` = one model per identical column set. |
-| `MIN_RUNS_PER_GROUP` | Group mode only: skip groups with fewer runs. |
-| `SPLIT_MODE` | `"auto"`, `"run"`, `"time"` or `"all"` (see section 5). |
-| `TEST_FRAC` | Fraction of runs (run mode) or of each run's end (time mode) used as test. |
-| `TIME_GAP_FRAMES` | Time mode: gap between train and test, in original frames. |
-| `LATENT_SWEEP` | Latent sizes to train and compare. |
-| `LATENT_DETAIL` | Latent size shown in the detailed histograms and per-dihedral plot. |
-| `HIDDEN` | Hidden layer widths, `(256, 128)`. |
-| `EPOCHS` | Training epochs (use 5 only for smoke tests). |
-| `BATCH_SIZE` | Batch size. Smaller is slower per epoch, especially on MPS. |
-| `LR` | AdamW learning rate. |
-| `SEED` | Seed for model initialisation and the run split. |
-| `OUT_DIR` | Where figures and CSVs are written. |
-| `SHOW_PLOTS` | `True` to also open the figures; call `plt.close(fig)` after saving if many figures stay open. |
+With `RESUME = True`, each finished latent size is saved as `eval_L<size>.pkl` plus its `models/ae_latent<size>.pt`. When the script starts, a size is reused only if the saved **configuration signature** matches. The signature includes `STRIDE`, `TRAIN_PASSES`, `MAX_TRAIN_FRAMES`, `SEED`, `HIDDEN`, `BATCH_SIZE`, `LR`, the number of runs, the column count `D`, the split mode, `TEST_FRAC`, the test thinning factor, and `SEG_LEN`.
+
+Not detected: edited source files, a changed `DATA_GLOB` that happens to give the same number of runs, and `BLOCK_FRAMES`. If you change the data, delete the matching cache files and the `eval_*.pkl` files.
+
+To force retraining, set `RESUME = False` or delete the `eval_*.pkl` files.
 
 ---
 
-## 10. Saving and inspecting model weights
+## 9. Saved models
 
-The script does not save models unless you add checkpointing inside the sweep loop:
+Each `models/ae_latent<size>.pt` contains `state_dict`, `latent`, `n_in`, `hidden`, `all_names` (the exact column order the model expects) and `stride`. Always use `all_names` when feeding new data: with padded columns the weights are meaningless without it.
 
-```python
-ckpt_dir = out / "models"; ckpt_dir.mkdir(exist_ok=True)
-torch.save({
-    "state_dict": {k: v.cpu() for k, v in m.state_dict().items()},
-    "latent": latent, "n_in": Xtr.shape[1], "hidden": HIDDEN,
-    "all_names": all_names,      # column order the model expects
-    "stride": STRIDE, "epochs": EPOCHS,
-}, ckpt_dir / f"ae_latent{latent}.pt")
-```
-
-Always store `all_names` with the weights: with padded columns, the weights are meaningless without the exact column order.
-
-**Quick look in a notebook (no model class needed):**
+Quick look in a notebook (no model class needed):
 
 ```python
 import torch, pandas as pd
-ck = torch.load("dihedral_ae_out/all_runs_padded/models/ae_latent8.pt", map_location="cpu")
+ck = torch.load("dihedral_ae_out_stream/all_runs_streamed/models/ae_latent8.pt", map_location="cpu")
 rows = [dict(tensor=k, shape=tuple(t.shape), params=t.numel(), mean=t.mean().item(),
              std=t.std().item(), finite=bool(torch.isfinite(t).all()))
         for k, t in ck["state_dict"].items()]
 print(pd.DataFrame(rows).to_string(index=False))
 ```
 
-**Sanity checks:** all tensors must be finite; weights should have means near 0 and standard deviations of roughly 0.01–0.3; a model rebuilt from the file must reproduce the in-memory reconstructions (maximum difference ~1e-6 or smaller).
-
-**Loading for later use:**
-
-```python
-model = AE(ck["n_in"], ck["latent"]).to(device)
-model.load_state_dict(ck["state_dict"]); model.eval()
-```
-
-New data must use the same column order (`ck["all_names"]`) and the same cos/sin layout.
+All tensors should be finite (`finite=True`); a non-finite tensor means training diverged.
 
 ---
 
-## 11. Caveats and limitations
+## 10. Limitations
 
-- **The mean baseline is weak.** It ignores all conformational states, so beating it is necessary but not impressive on its own. Two stronger comparisons are cheap and informative:
-  - **PCA on the cos/sin data** with the same number of components. If PCA matches the AE, nonlinearity is not adding much.
-  - **A noise floor** from the angular difference between consecutive frames (20 ps apart). If the AE median error is close to it, the remaining error is thermal fluctuation, not information loss.
-- **Reconstruction is not the same as predictive power.** A good reconstruction shows the data is compressible. It does not show that the latent code predicts unfolding or lifetimes; that needs a separate model.
-- **Name-based alignment** assumes the same name means the same structural position across runs.
-- **Undertrained models** (very few epochs) overstate the error and can hide the elbow in the latent curve.
-- **One seed.** Differences of a fraction of a degree between latent sizes are within run-to-run variation. Repeat with a few seeds before reading anything into small differences.
-- **Test frames are correlated** in time. Treat the frame-level statistics as descriptive, not as independent samples.
-- **Cache staleness.** Changing the source files without clearing `CACHE_DIR` silently reuses old data.
+- **Statistics describe the evaluated test frames**, which are an even thinning of the test set when it exceeds `MAX_TEST_FRAMES`. Raise `MAX_TEST_FRAMES` to evaluate more.
+- **The training loop was not run during development of this script.** The data loading, caching, block construction, evaluation, baseline and reporting were tested on synthetic data with a stand-in for the model. Run the smoke test before a long job.
+- **Training is budgeted, not exhaustive.** Each model sees at most `MAX_TRAIN_FRAMES` frames. Results at very small budgets (the smoke test) are not representative.
+- **The mean baseline is weak.** It ignores all conformational states. Useful stronger comparisons: PCA on the cos/sin data with the same number of components, and the angular difference between consecutive frames (a thermal-noise floor).
+- **Reconstruction is not predictive power.** A small reconstruction error shows the data is compressible; it does not show that the latent code predicts unfolding or lifetimes.
+- **Name-based alignment** assumes the same dihedral name means the same structural position across runs.
+- **One seed.** Differences of a fraction of a degree between latent sizes are within run-to-run variation.
+- **Test frames are correlated in time.** Treat frame-level statistics as descriptive, not as independent samples.
 
 ---
 
-## 12. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Cause / fix |
-|---------|-------------|
-| `FileNotFoundError: No files match DATA_GLOB` | Wrong pattern or working directory. The path is relative to where you run the script. |
+|---|---|
+| `FileNotFoundError: No files match DATA_GLOB` | Wrong pattern, or a different working directory (the pattern is relative to where you start the script). |
+| Windows: the script restarts or errors while parsing | Run it as a script (`python dihedral_ae_stream.py`), not from a notebook or an interactive console. |
 | `data columns but … header names` | A file has a malformed header or ragged rows. |
-| `contains NaN` | Clean the file before use. |
-| `KeyError: 'n_dihedrals'` (or other missing column) | The frame table must be built with the `n_dihedrals` column included. |
-| `NameError: te_run` / `te_t` | The split must use the four-value `stack(...)` and unpack `te_deg, te_pres, te_run, te_t`. |
-| Unpacking error in `GROUP_MODE = "group"` | Group code must carry `(array, names, file)` triples, not pairs. |
-| `Pandas4Warning … mean(1)` | Use `mean(axis=1)`. It is only a deprecation warning. |
-| Many figures kept open / memory warning | Call `plt.close(fig)` after each `savefig`. |
-| Very slow epochs | Increase `STRIDE` or `BATCH_SIZE`; use MPS/CUDA if available. |
-| Errors much worse than expected | Check `EPOCHS`; 5 epochs is a smoke test only. |
+| `non-finite values in …` | A cached run contains NaN/inf; fix the source file and delete its `.npy`. |
+| `no data rows after parsing` | A run file has only a header or is empty. |
+| `fewer training frames than BATCH_SIZE` | Too little training data for the batch size; reduce `BATCH_SIZE`. |
+| Out of memory | Lower `BLOCK_FRAMES` and `MAX_TEST_FRAMES`; close other programs. |
+| Very low `frames/s` | Slow disk or small `BATCH_SIZE`. Increase `BATCH_SIZE` (and `LR` slightly), check disk speed. |
+| Training loss does not fall | Check the first printed loss lines; try a larger `MAX_TRAIN_FRAMES`, or a smaller `LR`. |
+| Reusing old results unexpectedly | `RESUME = True` reuses matching `eval_*.pkl`; delete them or set `RESUME = False`. |
+| Duplicate run names warning | Folder names are not unique; per-run tables merge those runs. Rename folders or change the label rule in `main()`. |

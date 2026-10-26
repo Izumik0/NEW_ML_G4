@@ -10,8 +10,8 @@ from pathlib import Path
 
 # ---------- DATA ------------------
 CSV = '../lifetimes_data_simple.csv'
-NPZ_DIR = Path('../distance_matrix-kopia/')
-Cache_dir = Path('cache'); Cache_dir.mkdir(exist_ok=True)
+NPZ_DIR = Path('../distance_matrix/')
+Cache_dir = Path('../cache_matrix'); Cache_dir.mkdir(exist_ok=True)
 NPZ_key = None
 Store_DTYPE = np.float32
 Include_C=False
@@ -25,7 +25,7 @@ Latents = [2,4,8,16,32,64] # bottelneck of encoder
 MAP_Latent= 16
 Holdout = 0.2 # 20% of cache data is not seen in training by model (generalizaion check)
 Max_train_frame = 100000 #how much frames is used in training
-Epoches = 20
+Epoches = 3
 Batch = 32
 LR = 1e-3
 WD = 1e-4
@@ -33,7 +33,7 @@ PCA_frames=10000
 EVAL_subset = 1 #it determinates which frames are taken to testing (1 means all frames)
 BIN_ns=10
 SEED=42
-Out=Path("../Autoencoder_results_v2"); Out.mkdir(exist_ok=True)
+Out=Path("../Autoencoder_results_matrix"); Out.mkdir(exist_ok=True)
 
 if torch.cuda.is_available():
     device = torch.device('cuda')
@@ -105,16 +105,25 @@ df=df[df.m>0].reset_index(drop=True)
 # Data magic work
 class Frames(Dataset):
     def __init__(self, paths, items, scale):
-        self.paths, self.items, self.scale = paths, items, scale
+        self.paths = paths
+        self.items = items
+        self.scale = scale
+        self._mmaps = {}  # Lazily instantiated per worker process
 
     def __len__(self):
         return len(self.items)
 
+    def _get_mmap(self, k):
+        if k not in self._mmaps:
+            self._mmaps[k] = np.load(self.paths[k], mmap_mode="r")
+        return self._mmaps[k]
+
     def __getitem__(self, idx):
         k, pos = self.items[idx]
-        v = np.asarray(np.load(self.paths[k], mmap_mode='r')[pos], dtype=np.float32) / self.scale
-        x = np.zeros((N,N), np.float32)
-        x[IU]=v
+        arr = self._get_mmap(k)
+        v = np.asarray(arr[pos], dtype=np.float32) / self.scale
+        x = np.zeros((N, N), dtype=np.float32)
+        x[IU] = v
         return torch.from_numpy(x + x.T).unsqueeze(0), k, pos
 
 def all_it(runs):
@@ -172,7 +181,14 @@ def train(latent):
     model = ConvEncoder(latent).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Epoches)
-    dl = DataLoader(Frames(paths, train_items, SCALE), batch_size=Batch, shuffle=True, num_workers=0)
+    dl = DataLoader(
+        Frames(paths, train_items, SCALE),
+        batch_size=Batch,
+        shuffle=True,
+        num_workers=nw,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(nw > 0),
+    )
     for ep in range(Epoches):
         model.train(); total=n=0
         for x, _, _ in dl:

@@ -46,7 +46,7 @@ LR = 1e-3
 N_WORKERS = max(1, (os.cpu_count() or 2) - 2)   # parallel parsing of the text files (first pass only)
 
 #  how much data each model sees
-TRAIN_PASSES = 2.0              # passes over the training frames (can be fractional, e.g. 0.2)
+TRAIN_PASSES = 0.01              # passes over the training frames (can be fractional, e.g. 0.2)
 MAX_TRAIN_FRAMES = 100_000_000  # hard cap on frames seen per model (check the printed frames/s first!)
 
 # streaming / memory

@@ -94,261 +94,263 @@ def ensure_cache(r):
         tmp.rename(p)
     return np.load(p, mmap_mode='r').shape[0]
 
-ms = []
-for i, r in enumerate(df.itertuples()):
-    ms.append(ensure_cache(r))
-    if i%5 == 0:
-        print(f"cached {i}/{len(df)} runs")
-df['m']=ms
-df=df[df.m>0].reset_index(drop=True)
+if __name__=='__main__':
+    ms = []
+    for i, r in enumerate(df.itertuples()):
+        ms.append(ensure_cache(r))
+        if i%5 == 0:
+            print(f"cached {i}/{len(df)} runs")
+    df['m']=ms
+    df=df[df.m>0].reset_index(drop=True)
 
-# Data magic work
-class Frames(Dataset):
-    def __init__(self, paths, items, scale):
-        self.paths = paths
-        self.items = items
-        self.scale = scale
-        self._mmaps = {}  # Lazily instantiated per worker process
+    # Data magic work
+    class Frames(Dataset):
+        def __init__(self, paths, items, scale):
+            self.paths = paths
+            self.items = items
+            self.scale = scale
+            self._mmaps = {}  # Lazily instantiated per worker process
 
-    def __len__(self):
-        return len(self.items)
+        def __len__(self):
+            return len(self.items)
 
-    def _get_mmap(self, k):
-        if k not in self._mmaps:
-            self._mmaps[k] = np.load(self.paths[k], mmap_mode="r")
-        return self._mmaps[k]
+        def _get_mmap(self, k):
+            if k not in self._mmaps:
+                self._mmaps[k] = np.load(self.paths[k], mmap_mode="r")
+            return self._mmaps[k]
 
-    def __getitem__(self, idx):
-        k, pos = self.items[idx]
-        arr = self._get_mmap(k)
-        v = np.asarray(arr[pos], dtype=np.float32) / self.scale
-        x = np.zeros((N, N), dtype=np.float32)
-        x[IU] = v
-        return torch.from_numpy(x + x.T).unsqueeze(0), k, pos
+        def __getitem__(self, idx):
+            k, pos = self.items[idx]
+            arr = self._get_mmap(k)
+            v = np.asarray(arr[pos], dtype=np.float32) / self.scale
+            x = np.zeros((N, N), dtype=np.float32)
+            x[IU] = v
+            return torch.from_numpy(x + x.T).unsqueeze(0), k, pos
 
-def all_it(runs):
-    return [(k,p) for k,m in enumerate(runs.m.values) for p in range(m)]
+    def all_it(runs):
+        return [(k,p) for k,m in enumerate(runs.m.values) for p in range(m)]
 
-paths = list(df.npy)
-train_rows = np.flatnonzero((df.split == "train").values)
-train_items = [(int(k), p) for k in train_rows for p in range(df.m[k])]
-sel = rng.choice(len(train_items), min(Max_train_frame, len(train_items)), replace=False)
-train_items = [train_items[i] for i in sel]
-eval_items = all_it(df)[::EVAL_subset]
-print(f"training frames: {len(train_items)}, test frames: {len(eval_items)}")
+    paths = list(df.npy)
+    train_rows = np.flatnonzero((df.split == "train").values)
+    train_items = [(int(k), p) for k in train_rows for p in range(df.m[k])]
+    sel = rng.choice(len(train_items), min(Max_train_frame, len(train_items)), replace=False)
+    train_items = [train_items[i] for i in sel]
+    eval_items = all_it(df)[::EVAL_subset]
 
-# scale and total variance from a training sample (train data only)
-samp = [train_items[i] for i in rng.choice(len(train_items), min(PCA_frames, len(train_items)), replace=False)]
-V0 = np.stack([np.asarray(np.load(paths[k], mmap_mode="r")[p], dtype=np.float32) for k, p in samp])
-SCALE = float(np.percentile(V0, 99.9))
-V0 = torch.from_numpy(V0 / SCALE)
-MU = V0.mean(0)
-VAR_TOTAL = float(((V0 - MU) ** 2).mean())  # variance around the mean structure (scaled units)
-print(f"scale {SCALE:.2f} A; predicting the mean structure gives RMSE {np.sqrt(VAR_TOTAL) * SCALE:.3f} A")
+    # scale and total variance from a training sample (train data only)
+    samp = [train_items[i] for i in rng.choice(len(train_items), min(PCA_frames, len(train_items)), replace=False)]
+    V0 = np.stack([np.asarray(np.load(paths[k], mmap_mode="r")[p], dtype=np.float32) for k, p in samp])
+    SCALE = float(np.percentile(V0, 99.9))
+    V0 = torch.from_numpy(V0 / SCALE)
+    MU = V0.mean(0)
+    VAR_TOTAL = float(((V0 - MU) ** 2).mean())  # variance around the mean structure (scaled units)
 
-# ---------------- MODELS ---------------------
+    # ---------------- MODELS ---------------------
 
-def blok(i,o):
-    x = nn.Sequential(nn.Conv2d(i,o,3, stride=2, padding=1), nn.BatchNorm2d(o), nn.ReLU())
-    return x
+    def blok(i,o):
+        x = nn.Sequential(nn.Conv2d(i,o,3, stride=2, padding=1), nn.BatchNorm2d(o), nn.ReLU())
+        return x
 
-def up(i,o):
-    x = nn.Sequential(nn.Upsample(scale_factor=2, mode='nearest'),
-                      nn.Conv2d(i,o,3, padding=1), nn.BatchNorm2d(o), nn.ReLU())
-    return x
+    def up(i,o):
+        x = nn.Sequential(nn.Upsample(scale_factor=2, mode='nearest'),
+                          nn.Conv2d(i,o,3, padding=1), nn.BatchNorm2d(o), nn.ReLU())
+        return x
 
-class ConvEncoder(nn.Module):
-    def __init__(self, latent):
-        super().__init__()
-        self.encoder = nn.Sequential(blok(1,16), blok(16,32),blok(32,64),blok(64, 128))
-        self.to_z= nn.Linear(128*10*10, latent)
-        self.from_z = nn.Linear(latent, 128*10*10)
-        self.decoder = nn.Sequential(up(128,64),up(64,32),up(32,16),
-                                     nn.Upsample(scale_factor=2, mode='nearest'),
-                                     nn.Conv2d(16,1,3, padding=1))
+    class ConvEncoder(nn.Module):
+        def __init__(self, latent):
+            super().__init__()
+            self.encoder = nn.Sequential(blok(1,16), blok(16,32),blok(32,64),blok(64, 128))
+            self.to_z= nn.Linear(128*10*10, latent)
+            self.from_z = nn.Linear(latent, 128*10*10)
+            self.decoder = nn.Sequential(up(128,64),up(64,32),up(32,16),
+                                         nn.Upsample(scale_factor=2, mode='nearest'),
+                                         nn.Conv2d(16,1,3, padding=1))
 
-    def forward(self, x):
-        x=F.pad(x, (1,1,1,1), mode='replicate')
-        z=self.to_z(self.encoder(x).flatten(1))
-        out = self.decoder(self.from_z(z).view(-1,128,10,10))[:,:,1:-1,1:-1]
-        return 0.5*(out+out.transpose(2,3)), z
+        def forward(self, x):
+            x=F.pad(x, (1,1,1,1), mode='replicate')
+            z=self.to_z(self.encoder(x).flatten(1))
+            out = self.decoder(self.from_z(z).view(-1,128,10,10))[:,:,1:-1,1:-1]
+            return 0.5*(out+out.transpose(2,3)), z
 
-def recon_loss(out,x):
-    d=(out-x)[:,0,IU_T[0],IU_T[1]]
-    return (d**2).mean(dim=1)
+    def recon_loss(out,x):
+        d=(out-x)[:,0,IU_T[0],IU_T[1]]
+        return (d**2).mean(dim=1)
 
-def train(latent):
-    model = ConvEncoder(latent).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Epoches)
-    dl = DataLoader(
-        Frames(paths, train_items, SCALE),
-        batch_size=Batch,
-        shuffle=True,
-        num_workers=nw,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(nw > 0),
-    )
-    for ep in range(Epoches):
-        model.train(); total=n=0
-        for x, _, _ in dl:
-            x=x.to(device)
-            loss=recon_loss(model(x)[0], x).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total += loss.item()*len(x); n+=len(x)
+    def train(latent):
+        model = ConvEncoder(latent).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Epoches)
+        dl = DataLoader(
+            Frames(paths, train_items, SCALE),
+            batch_size=Batch,
+            shuffle=True,
+            num_workers=nw,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(nw > 0),
+        )
+        for ep in range(Epoches):
+            model.train(); total=n=0
+            for x, _, _ in dl:
+                x=x.to(device)
+                loss=recon_loss(model(x)[0], x).mean()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total += loss.item()*len(x); n+=len(x)
 
-        scheduler.step()
-        print(f" L={latent} | epoch: {ep:2d} | Train mse: {total/n:.5f}")
-    return model.eval()
+            scheduler.step()
+            print(f" L={latent} | epoch: {ep:2d} | Train mse: {total/n:.5f}")
+        return model.eval()
 
-# PCA baselinfe for comparing neural network encoder and linear compression
-_,_,PCA_V = torch.pca_lowrank(V0-MU, q=max(Latents), center=False, niter=4)
+    # PCA baselinfe for comparing neural network encoder and linear compression
+    _,_,PCA_V = torch.pca_lowrank(V0-MU, q=max(Latents), center=False, niter=4)
 
-@torch.no_grad()
-def eval(model, latent, with_pca=True,map_rows=None):
+    @torch.no_grad()
+    def eval(model, latent, with_pca=True,map_rows=None):
 
-    enc, pca, zs = [], {L:[] for L in Latents}, []
-    emap, nmap = torch.zeros(N,N,device=device), 0
-    held_rows = torch.from_numpy((df.split=="holdout").values)
-    for x, k , p in DataLoader(Frames(paths, eval_items, SCALE), batch_size=Batch, num_workers=nw, pin_memory=(device.type=='cuda')):
-        xd=x.to(device)
-        out=model(xd)[0]
-        enc.append(recon_loss(out, xd).cpu())
+        enc, pca, zs = [], {L:[] for L in Latents}, []
+        emap, nmap = torch.zeros(N,N,device=device), 0
+        held_rows = torch.from_numpy((df.split=="holdout").values)
+        for x, k , p in DataLoader(Frames(paths, eval_items, SCALE), batch_size=Batch, num_workers=nw, pin_memory=(device.type=='cuda')):
+            xd=x.to(device)
+            out=model(xd)[0]
+            enc.append(recon_loss(out, xd).cpu())
 
+            if with_pca:
+                xc = x[:, 0, IU_T[0], IU_T[1]] - MU
+                z = xc@PCA_V
+                for L in Latents:
+                    pca[L].append(((xc - z[:, :L] @ PCA_V[:, :L].T) ** 2).mean(1))
+
+            if map_rows:
+                m = held_rows[k].to(device)
+                if m.any():
+                    emap += ((out - xd) ** 2)[m, 0].sum(0)
+                    nmap += int(m.sum())
+        res = {'enc':torch.cat(enc).numpy()}
         if with_pca:
-            xc = x[:, 0, IU_T[0], IU_T[1]] - MU
-            z = xc@PCA_V
-            for L in Latents:
-                pca[L].append(((xc - z[:, :L] @ PCA_V[:, :L].T) ** 2).mean(1))
-
+            res["pca"] = {L: torch.cat(v).numpy() for L, v in pca.items()}
         if map_rows:
-            m = held_rows[k].to(device)
-            if m.any():
-                emap += ((out - xd) ** 2)[m, 0].sum(0)
-                nmap += int(m.sum())
-    res = {'enc':torch.cat(enc).numpy()}
-    if with_pca:
-        res["pca"] = {L: torch.cat(v).numpy() for L, v in pca.items()}
-    if map_rows:
-        res["map"] = (emap / max(nmap, 1)).cpu().numpy()
-    return res
+            res["map"] = (emap / max(nmap, 1)).cpu().numpy()
+        return res
 
 
-meta = pd.DataFrame(eval_items, columns=["k", "pos"]).join(df[["seq", "top", "lay", "copy", "group", "split"]], on="k")
-meta["t_ns"] = meta.pos * Stride * DT_PS / 1000
-for i, L in enumerate(Latents):
-    print(f"\n=== bottleneck {L}")
-    model = train(L)
-    r = eval(model, L, with_pca=(i == 0), map_rows=(L == MAP_Latent))
-    meta[f"enc_{L}"] = r["enc"]
-    if i == 0:
-        for LL, e in r["pca"].items():
-            meta[f"pca_{LL}"] = e
-    if L == MAP_Latent:
-        np.save(Out / "error_map.npy", r["map"])
-    torch.save({"model": model.state_dict(), "scale": SCALE}, Out / f"ae_L{L}.pt")
-meta.to_csv(Out / "frame_errors.csv.gz", index=False)
+    meta = pd.DataFrame(eval_items, columns=["k", "pos"]).join(df[["seq", "top", "lay", "copy", "group", "split"]], on="k")
+    meta["t_ns"] = meta.pos * Stride * DT_PS / 1000
 
-NB, XMAX, STEP = 100, 1.0, 5       # bins, largest error drawn, use every 5th test frame
-UNIT = "nm"
-edges = np.linspace(0, XMAX, NB + 1); width = edges[1] - edges[0]
+    print(f"training frames: {len(train_items)}, test frames: {len(eval_items)}")
+    print(f"scale {SCALE:.2f} A; predicting the mean structure gives RMSE {np.sqrt(VAR_TOTAL) * SCALE:.3f} A")
+    for i, L in enumerate(Latents):
+        print(f"\n=== bottleneck {L}")
+        model = train(L)
+        r = eval(model, L, with_pca=(i == 0), map_rows=(L == MAP_Latent))
+        meta[f"enc_{L}"] = r["enc"]
+        if i == 0:
+            for LL, e in r["pca"].items():
+                meta[f"pca_{LL}"] = e
+        if L == MAP_Latent:
+            np.save(Out / "error_map.npy", r["map"])
+        torch.save({"model": model.state_dict(), "scale": SCALE}, Out / f"ae_L{L}.pt")
+    meta.to_csv(Out / "frame_errors.csv.gz", index=False)
 
-models = {}
-for L in Latents:
-    ck = torch.load(Out / f"ae_L{L}.pt", map_location=device)
-    m = ConvEncoder(L).to(device); m.load_state_dict(ck["model"]); models[L] = m.eval()
+    NB, XMAX, STEP = 100, 1.0, 5       # bins, largest error drawn, use every 5th test frame
+    UNIT = "nm"
+    edges = np.linspace(0, XMAX, NB + 1); width = edges[1] - edges[0]
 
-subsets = ["all", "holdout"]
-acc = {(n, s): dict(h=torch.zeros(NB, dtype=torch.float64), s=0.0, n=0)
-       for n in ["baseline"] + Latents for s in subsets}
-held_rows = torch.from_numpy(np.array((df.split == "holdout").values))
+    models = {}
+    for L in Latents:
+        ck = torch.load(Out / f"ae_L{L}.pt", map_location=device)
+        m = ConvEncoder(L).to(device); m.load_state_dict(ck["model"]); models[L] = m.eval()
 
-def add(n, s, err):                          # err: 1-D CPU tensor of absolute errors
-    a = acc[(n, s)]
-    a["h"] += torch.histc(err, bins=NB, min=0, max=XMAX).double()
-    a["s"] += err.double().sum().item(); a["n"] += err.numel()
+    subsets = ["all", "holdout"]
+    acc = {(n, s): dict(h=torch.zeros(NB, dtype=torch.float64), s=0.0, n=0)
+           for n in ["baseline"] + Latents for s in subsets}
+    held_rows = torch.from_numpy(np.array((df.split == "holdout").values))
 
-sub = eval_items[::STEP]
-with torch.no_grad():
-    for b, (x, k, p) in enumerate(DataLoader(Frames(paths, sub, SCALE), batch_size=64, num_workers=nw, pin_memory=(device.type == "cuda"))):
-        xd = x.to(device)
-        xt = x[:, 0, IU_T[0], IU_T[1]]                           # scaled upper triangle (CPU)
-        errs = {"baseline": (xt - MU).abs() * SCALE}
-        for L, m in models.items():
-            out = m(xd)[0][:, 0, IU_T[0], IU_T[1]].cpu()
-            errs[L] = (out - xt).abs() * SCALE
-        is_h = held_rows[k]
-        for n, e in errs.items():
-            add(n, "all", e.flatten())
-            if is_h.any():
-                add(n, "holdout", e[is_h].flatten())
-        if b % 100 == 0:
-            print(f"batch {b}", flush=True)
+    def add(n, s, err):                          # err: 1-D CPU tensor of absolute errors
+        a = acc[(n, s)]
+        a["h"] += torch.histc(err, bins=NB, min=0, max=XMAX).double()
+        a["s"] += err.double().sum().item(); a["n"] += err.numel()
 
-fig, axs = plt.subplots(1, 2, figsize=(14, 6.5))
-cols = plt.cm.viridis(np.linspace(0, 0.9, len(Latents)))
-for ax, s, title in zip(axs, subsets, ["All test values", "Held-out sequences only"]):
-    a = acc[("baseline", s)]
-    ax.bar(edges[:-1], a["h"].numpy() / a["n"] / width, width=width, align="edge", color="0.75",
-           label=f"baseline, mean structure ({a['s'] / a['n']:.3f} {UNIT})")
-    for L, c in zip(Latents, cols):
-        a = acc[(L, s)]
-        ax.stairs(a["h"].numpy() / a["n"] / width, edges, color=c, lw=1.8,
-                  label=f"AE latent {L} ({a['s'] / a['n']:.3f} {UNIT})")
-    ax.set(title=title, xlabel=f"absolute distance error ({UNIT})", ylabel="density")
-    ax.legend(fontsize=8)
-fig.tight_layout(); fig.savefig(Out / "error_histograms.png", dpi=150)
+    sub = eval_items[::STEP]
+    with torch.no_grad():
+        for b, (x, k, p) in enumerate(DataLoader(Frames(paths, sub, SCALE), batch_size=64, num_workers=nw, pin_memory=(device.type == "cuda"))):
+            xd = x.to(device)
+            xt = x[:, 0, IU_T[0], IU_T[1]]                           # scaled upper triangle (CPU)
+            errs = {"baseline": (xt - MU).abs() * SCALE}
+            for L, m in models.items():
+                out = m(xd)[0][:, 0, IU_T[0], IU_T[1]].cpu()
+                errs[L] = (out - xt).abs() * SCALE
+            is_h = held_rows[k]
+            for n, e in errs.items():
+                add(n, "all", e.flatten())
+                if is_h.any():
+                    add(n, "holdout", e[is_h].flatten())
+            if b % 100 == 0:
+                print(f"batch {b}", flush=True)
 
-# %% summary table
-rows = []
-for L in Latents:
-    for method in ["enc", "pca"]:
-        for name, d in [("all", meta), ("train seqs", meta[meta.split == "train"]),
-                        ("held-out seqs", meta[meta.split == "holdout"])]:
-            mse = d[f"{method}_{L}"].mean()
-            rows.append(dict(latent=L, method=method, subset=name, rmse_nm=np.sqrt(mse) * SCALE,
-                             R2=1 - mse / VAR_TOTAL))
-summary = pd.DataFrame(rows)
-summary.to_csv(Out / "summary.csv", index=False)
-print(summary.pivot_table(index="latent", columns=["method", "subset"], values="rmse_nm").round(3))
-print(f"\nreference: mean structure only -> RMSE {np.sqrt(VAR_TOTAL) * SCALE:.3f} nm")
+    fig, axs = plt.subplots(1, 2, figsize=(14, 6.5))
+    cols = plt.cm.viridis(np.linspace(0, 0.9, len(Latents)))
+    for ax, s, title in zip(axs, subsets, ["All test values", "Held-out sequences only"]):
+        a = acc[("baseline", s)]
+        ax.bar(edges[:-1], a["h"].numpy() / a["n"] / width, width=width, align="edge", color="0.75",
+               label=f"baseline, mean structure ({a['s'] / a['n']:.3f} {UNIT})")
+        for L, c in zip(Latents, cols):
+            a = acc[(L, s)]
+            ax.stairs(a["h"].numpy() / a["n"] / width, edges, color=c, lw=1.8,
+                      label=f"AE latent {L} ({a['s'] / a['n']:.3f} {UNIT})")
+        ax.set(title=title, xlabel=f"absolute distance error ({UNIT})", ylabel="density")
+        ax.legend(fontsize=8)
+    fig.tight_layout(); fig.savefig(Out / "error_histograms.png", dpi=150)
 
-# %% plots
-fig, axs = plt.subplots(1, 2, figsize=(11, 4))
-for method, ls in [("enc", "-"), ("pca", "--")]:
-    for name, c in [("all", "k"), ("held-out seqs", "tab:red")]:
-        d = summary[(summary.method == method) & (summary.subset == name)]
-        axs[0].plot(d.latent, d.rmse_nm, ls, color=c, marker="o", label=f"{method.upper()}, {name}")
-        axs[1].plot(d.latent, d.R2, ls, color=c, marker="o")
-axs[0].set(xscale="log", yscale="log", xlabel="bottleneck size", ylabel="reconstruction RMSE (A)")
-axs[0].legend();
-axs[1].set(xscale="log", xlabel="bottleneck size", ylabel="variance explained (R$^2$)")
-fig.tight_layout();
-fig.savefig(Out / "error_vs_bottleneck.png", dpi=150)
+    # %% summary table
+    rows = []
+    for L in Latents:
+        for method in ["enc", "pca"]:
+            for name, d in [("all", meta), ("train seqs", meta[meta.split == "train"]),
+                            ("held-out seqs", meta[meta.split == "holdout"])]:
+                mse = d[f"{method}_{L}"].mean()
+                rows.append(dict(latent=L, method=method, subset=name, rmse_nm=np.sqrt(mse) * SCALE,
+                                 R2=1 - mse / VAR_TOTAL))
+    summary = pd.DataFrame(rows)
+    summary.to_csv(Out / "summary.csv", index=False)
+    print(summary.pivot_table(index="latent", columns=["method", "subset"], values="rmse_nm").round(3))
+    print(f"\nreference: mean structure only -> RMSE {np.sqrt(VAR_TOTAL) * SCALE:.3f} nm")
 
-col = f"enc_{MAP_Latent}"
-meta["bin"] = (meta.t_ns // BIN_ns) * BIN_ns + BIN_ns / 2
-fig, ax = plt.subplots(figsize=(6, 4))
-for g, d in meta.groupby("group"):
-    m = d.groupby("bin")[col].mean()
-    ax.plot(m.index, np.sqrt(m) * SCALE, marker="o", label=f"group {g}")
-ax.set(xlabel="time (ns)", ylabel="RMSE (nm)", title=f"AE reconstruction error over time (bottleneck {MAP_Latent})")
-ax.legend()
-fig.tight_layout()
-fig.savefig(Out / "error_vs_time.png", dpi=150)
+    # %% plots
+    fig, axs = plt.subplots(1, 2, figsize=(11, 4))
+    for method, ls in [("enc", "-"), ("pca", "--")]:
+        for name, c in [("all", "k"), ("held-out seqs", "tab:red")]:
+            d = summary[(summary.method == method) & (summary.subset == name)]
+            axs[0].plot(d.latent, d.rmse_nm, ls, color=c, marker="o", label=f"{method.upper()}, {name}")
+            axs[1].plot(d.latent, d.R2, ls, color=c, marker="o")
+    axs[0].set(xscale="log", yscale="log", xlabel="bottleneck size", ylabel="reconstruction RMSE (A)")
+    axs[0].legend();
+    axs[1].set(xscale="log", xlabel="bottleneck size", ylabel="variance explained (R$^2$)")
+    fig.tight_layout();
+    fig.savefig(Out / "error_vs_bottleneck.png", dpi=150)
 
-fig, ax = plt.subplots(figsize=(5, 4.5))
-im = ax.imshow(np.sqrt(np.load(Out / "error_map.npy")) * SCALE, cmap="magma")
-ax.set_title(f"RMSE per residue pair (nm), held-out seqs, bottleneck {MAP_Latent}")
-fig.colorbar(im)
-fig.tight_layout()
-fig.savefig(Out / "error_map.png", dpi=150)
+    col = f"enc_{MAP_Latent}"
+    meta["bin"] = (meta.t_ns // BIN_ns) * BIN_ns + BIN_ns / 2
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for g, d in meta.groupby("group"):
+        m = d.groupby("bin")[col].mean()
+        ax.plot(m.index, np.sqrt(m) * SCALE, marker="o", label=f"group {g}")
+    ax.set(xlabel="time (ns)", ylabel="RMSE (nm)", title=f"AE reconstruction error over time (bottleneck {MAP_Latent})")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(Out / "error_vs_time.png", dpi=150)
 
-# error by condition: is information lost more for some topologies / layouts?
-by = meta.groupby(["lay", "top"])[col].mean().pipe(lambda s: np.sqrt(s) * SCALE).rename("rmse_nm")
-by.sort_values().to_csv(Out / "rmse_by_condition.csv")
+    fig, ax = plt.subplots(figsize=(5, 4.5))
+    im = ax.imshow(np.sqrt(np.load(Out / "error_map.npy")) * SCALE, cmap="magma")
+    ax.set_title(f"RMSE per residue pair (nm), held-out seqs, bottleneck {MAP_Latent}")
+    fig.colorbar(im)
+    fig.tight_layout()
+    fig.savefig(Out / "error_map.png", dpi=150)
+
+    # error by condition: is information lost more for some topologies / layouts?
+    by = meta.groupby(["lay", "top"])[col].mean().pipe(lambda s: np.sqrt(s) * SCALE).rename("rmse_nm")
+    by.sort_values().to_csv(Out / "rmse_by_condition.csv")
 
 
 

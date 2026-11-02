@@ -1,13 +1,11 @@
-from collections import Counter
 import os
+import sys
 import pandas as pd
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
-from asyncssh import forward
-from sklearn import model_selection
 from torch import optim
-from torch.utils.data import TensorDataset, DataLoader, Dataset
-from sklearn.metrics import mean_absolute_error, r2_score, confusion_matrix
+from torch.utils.data import  DataLoader, Dataset
+from sklearn.metrics import confusion_matrix
 import matplotlib.pyplot as plt
 import re
 import copy
@@ -20,22 +18,22 @@ from sklearn.model_selection import GroupShuffleSplit
 # Config - that can be changed
 
 # ----------- Dir config -----------
-IN_DIR = Path('../cache_dihedrals/')
+IN_DIR = Path('../Autoencoder/cache_dihedrals/')
 OUT_DIR = Path('../struc_rec_dih_test/')
 
 # ----------- Data Config -------------
-frames_train = 350
-frames_test = 75
+frames_train = 500
+frames_test = 150
 
 # ----------- Model Config -----------
-hidden_dims = 5
-batch_size = 32
+hidden_dims = 128
+batch_size = 256
 drop = 0.3
 LR = 1e-5
 WD = 1e-3
 patience = 5
-epoches = 100
-rnd_state = 3
+epoches = 10
+rnd_state = 69
 
 # ----------- Dirs things ----------------------
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -114,7 +112,7 @@ def labels_from_path(path, vocab):
 
 N_COLS = 138
 class DihedralDataset(Dataset):
-    def __init__(self, runs, manifest, frames, fixed=False):
+    def __init__(self, runs, manifest, frames, fixed=True):
         self.runs, self.m, self.n, self.fixed = runs, manifest, frames, fixed
         self.T = {r: manifest[r]["n_frames"] for r in runs}
         if fixed:

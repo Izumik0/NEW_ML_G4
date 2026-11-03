@@ -87,6 +87,20 @@
             </Attribute>
           </value>
         </entry>
+        <entry key="\lifetimes_data_simple.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="\struc_rec_dih_test\predictions.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
       </map>
     </option>
   </component>

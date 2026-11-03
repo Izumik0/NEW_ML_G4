@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 # -------- Config -------------
 
 # --------- Files config --------------
-IN_DIR = "../Autoencoder/cache_dihedrals"
+IN_DIR = "../cache_dihedrals"
 OUT_DIR = "dihedrals_ts_test/"
 csv_file = "../lifetimes_data_simple.csv"
 
@@ -232,6 +232,32 @@ def plot_summary(items, probs, tau=0.9, k=3):
     plt.tight_layout()
     plt.savefig(OUT_DIR + "/threshold_summary.png", dpi=150)
 
+def save_predictions(model, splits, path=OUT_DIR + "/predictions.csv.gz"):
+    """splits: dict like {"train": tr, "test": ts}. One row per run and frame."""
+    model.eval()
+    frames = []
+    with torch.no_grad():
+        for split, its in splits.items():
+            for it in its:
+                pth, unf_ps = it
+                X, Y = UnfDB([it])[0]
+                logits, _ = model(X[None].to(device))
+                p = torch.sigmoid(logits[0]).cpu().numpy()
+                seq, top, lay, cp = parse_names(pth)
+                T = len(p)
+                frames.append(pd.DataFrame({
+                    "run": f"{seq}_{top}_{lay}_{cp}",
+                    "split": split, "seq": seq, "top": top, "lay": lay, "copy": cp,
+                    "unf_ps": unf_ps, "stable": unf_ps >= 1_000_000,
+                    "frame": np.arange(T),
+                    "time_ns": np.arange(T) * Frames_ps / 1000,
+                    "label": Y.numpy(),
+                    "prob": p,
+                }))
+    df = pd.concat(frames, ignore_index=True)
+    df.to_csv(path, index=False, float_format="%.5f")   # .gz extension compresses automatically
+    print(f"saved {len(df)} rows from {df['run'].nunique()} runs to {path}")
+
 
 # ------------ Model Arch ------------
 class FellingCollaps(nn.Module):
@@ -297,7 +323,7 @@ def train(items, epochs=Epoches, batch_size=bs, learning_rate=LR, p=Patience):
             if bad >= p: break
 
     model.load_state_dict(best_so_far)
-    return model, ts, hist
+    return model, tr, ts, hist
 
 @torch.no_grad()
 def eval_stopping(model, val_items, taus=(0.5, 0.7, 0.8, 0.9, 0.95), k=3):
@@ -332,9 +358,10 @@ def eval_stopping(model, val_items, taus=(0.5, 0.7, 0.8, 0.9, 0.95), k=3):
 # ------------ code ------------
 
 items,_=build_items(IN_DIR, csv_file)
-model, test_items, hist = train(items)
+model, train_items, test_items, hist = train(items)
 eval_stopping(model, test_items)
 probs = get_probs(model, test_items)
 plot_training(hist)
-plot_traces(test_items, probs, tau=0.9)
-plot_summary(test_items, probs, tau=0.9)
+plot_traces(test_items, probs, tau=0.8)
+plot_summary(test_items, probs, tau=0.8)
+save_predictions(model, {'train': train_items, 'test': test_items})

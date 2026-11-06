@@ -3,21 +3,14 @@
   <component name="CsvFileAttributes">
     <option name="attributeMap">
       <map>
-        <entry key="/Autoencoder_results/Autoencoder_results_v1/rmse_by_condition.csv">
+        <entry key="/AE_test.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="/Autoencoder_results/Autoencoder_results_v1/rmse_by_condition_L64.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="/Autoencoder_results/Autoencoder_results_v1/summary.csv">
+        <entry key="/Autoencoder_results_matrix/rmse_by_condition.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
@@ -31,20 +24,6 @@
             </Attribute>
           </value>
         </entry>
-        <entry key="/dihedral_ae_out_stream/all_runs_streamed/frame_errors_all_latents.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="/dihedral_ae_out_stream/all_runs_streamed/per_run_error_all_latents.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
         <entry key="/lifetimes_data_simple.csv">
           <value>
             <Attribute>
@@ -52,35 +31,28 @@
             </Attribute>
           </value>
         </entry>
-        <entry key="\Autoencoder_results_v2\rmse_by_condition.csv">
+        <entry key="/results_real/AE_dihedral_261026/dihedral_ae_n_v1/all_runs_streamed/per_run_error_all_latents.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="\Autoencoder_results_v2\summary.csv">
+        <entry key="/results_real/AE_dihedral_261026/dihedral_ae_test/all_runs_streamed/per_run_error_all_latents.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="\dihedral_ae_out\all_runs_padded\frame_error.csv">
+        <entry key="/results_real/matrix_ae_271026/matrix_1_AE/rmse_by_condition.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="\dihedral_ae_out\all_runs_padded\frame_errors_all_latents.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="\dihedral_ae_out\all_runs_padded\per_run_error_all_latents.csv">
+        <entry key="/results_real/matrix_ae_271026/matrix_1_AE/summary.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
@@ -88,13 +60,6 @@
           </value>
         </entry>
         <entry key="\lifetimes_data_simple.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="\struc_rec_dih_test\predictions.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />

@@ -1,9 +1,13 @@
-
+import re
 from itertools import islice
 from pathlib import Path
-
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
+
+
+#some things
+FILE_KEYS = ("seq", "top", "lay", "copy", "run")     # filters on these are applied before reading any file
 
 
 
@@ -11,7 +15,6 @@ import numpy as np
 # model <-> arrays
 # ---------------------------------------------------------------------
 def encode(model, x, device="cpu", batch=16384):
-    """(N, 2D) model input -> (N, latent) latent codes."""
     import torch
     out = []
     with torch.no_grad():
@@ -42,7 +45,6 @@ def decode_to_degrees(model, z, device="cpu"):
 
 
 def collect_latents(model, all_names, files, prepare_input, stride=50, max_per_run=1000, device="cpu"):
-
     Z, T, R, ND, E, TR, V = [], [], [], [], [], [], []
     for f in files:
         with open(f) as fh:
@@ -65,6 +67,90 @@ def collect_latents(model, all_names, files, prepare_input, stride=50, max_per_r
         TR.append(np.where(valid, full, np.nan)); V.append(valid)
     return dict(z=np.concatenate(Z), t_ns=np.concatenate(T), run=np.concatenate(R), n_dih=np.concatenate(ND),
                 err=np.concatenate(E), true=np.concatenate(TR), valid=np.concatenate(V))
+
+
+# ---------------------------------------------------------------------
+# run labels (seq / top / lay / copy) and filters
+# ---------------------------------------------------------------------
+_RUN_RE = re.compile(r"^(\d+)_(.+)_([^_]+)_(\d+)$")
+
+
+def parse_run_label(name):
+    m = _RUN_RE.match(str(name))
+    if not m:
+        return dict(seq="?", top="?", lay="?", copy="?")
+    seq, top, lay, copy = m.groups()
+    return dict(seq=seq, top=top, lay=lay, copy=copy)
+
+
+def add_labels(data, parser=parse_run_label, extra=None):
+    runs = np.asarray(data["run"]).astype(str)
+    uniq, inv = np.unique(runs, return_inverse=True)
+    parsed = [parser(u) for u in uniq]
+    for k in parsed[0]:
+        data[k] = np.array([pp[k] for pp in parsed], dtype=object)[inv]
+    if extra is not None:
+        for c in extra.columns:
+            data[c] = extra[c].reindex(uniq).to_numpy()[inv]
+    if (data.get("seq") == "?").all():
+        print("WARNING: no run name matched <seq>_<top>_<lay>_<copy>; pass parser=... to add_labels")
+    return data
+
+
+def describe_labels(data, keys=("seq", "top", "lay", "copy")):
+    runs = np.asarray(data["run"]).astype(str)
+    for k in keys:
+        if k not in data:
+            continue
+        vals = np.asarray(data[k]).astype(str)
+        u, c = np.unique(vals, return_counts=True)
+        nr = [len(set(runs[vals == x])) for x in u]
+        print(f"{k}: " + ", ".join(f"{x} ({r} runs, {n:,} frames)" for x, r, n in zip(u, nr, c)))
+
+
+def _match(v, cond):
+    v = np.asarray(v)
+    if callable(cond):
+        if v.dtype.kind in "fiub":
+            return np.asarray(cond(v), bool)
+        u, inv = np.unique(v.astype(str), return_inverse=True)
+        return np.array([bool(cond(x)) for x in u])[inv]
+    if v.dtype.kind in "fiub":                                    # numeric field
+        if isinstance(cond, tuple) and len(cond) == 2:            # (min, max); None = open end
+            lo, hi = cond
+            ok = np.isfinite(v)
+            if lo is not None:
+                ok &= v >= lo
+            if hi is not None:
+                ok &= v <= hi
+            return ok
+        conds = [cond] if np.isscalar(cond) else list(cond)
+        return np.isin(v, conds)
+    vs = v.astype(str)                                            # categorical field
+    conds = [str(cond)] if np.isscalar(cond) else [str(c) for c in cond]
+    inc = [c for c in conds if not c.startswith("!")]
+    exc = [c[1:] for c in conds if c.startswith("!")]
+    ok = np.isin(vs, inc) if inc else np.ones(len(vs), bool)
+    if exc:
+        ok &= ~np.isin(vs, exc)
+    return ok
+
+
+match_values = _match
+
+
+def make_filter(data, **filters):
+
+    n = len(data["z"])
+    keep = np.ones(n, bool)
+    skip = {"z", "true", "valid"}
+    for key, cond in filters.items():
+        if key not in data or key in skip:
+            raise KeyError(f"unknown filter '{key}'. Available: {sorted(k for k in data if k not in skip)}")
+        keep &= _match(data[key], cond)
+    nr = len(set(np.asarray(data["run"])[keep].astype(str)))
+    print(f"filter keeps {int(keep.sum()):,} of {n:,} frames ({nr} runs)")
+    return keep
 
 
 # ---------------------------------------------------------------------
@@ -100,42 +186,133 @@ def plot_overview(z, p):
     fig.tight_layout(); plt.show()
 
 
-def embed_2d(z, method="pca", max_points=20000, seed=0):
-    """-> (xy (M, 2), selected indices (M,)). 't-SNE' and 'umap' need scikit-learn / umap-learn."""
+def embed_2d(z, method="pca", max_points=20000, seed=0, mask=None, pca_fit="all"):
+    """
+    -> (xy (M, 2), sel (M,)): coordinates and the indices (into the arrays of `data`) of the frames shown.
+    mask    : boolean filter from make_filter(); only these frames are shown (None = all frames)
+    pca_fit : 'all'      = the PCA axes are fitted on ALL frames, so different filters share the same axes
+                           and are directly comparable;
+              'selected' = the axes are fitted on the filtered frames only.
+              t-SNE and UMAP are always fitted on the filtered frames, so their layout changes with the filter.
+    """
     rng = np.random.default_rng(seed)
-    sel = np.sort(rng.choice(len(z), min(max_points, len(z)), replace=False))
-    zs = z[sel]
+    cand = np.arange(len(z)) if mask is None else np.flatnonzero(mask)
+    if len(cand) == 0:
+        raise ValueError("the filter removed every frame")
+    sel = np.sort(rng.choice(cand, min(max_points, len(cand)), replace=False))
     if method == "pca":
-        p = pca(zs)
-        return p["scores"][:, :2], sel
+        fit = z if pca_fit == "all" else z[cand]
+        if len(fit) > 200000:
+            fit = fit[rng.choice(len(fit), 200000, replace=False)]
+        mu = fit.mean(0)
+        Vt = np.linalg.svd(fit - mu, full_matrices=False)[2]
+        return (z[sel] - mu) @ Vt[:2].T, sel
     if method == "tsne":
         from sklearn.manifold import TSNE
-        return TSNE(n_components=2, init="pca", perplexity=30, random_state=seed).fit_transform(zs), sel
+        return TSNE(n_components=2, init="pca", perplexity=min(30, max(5, len(sel) // 4)),
+                    random_state=seed).fit_transform(z[sel]), sel
     if method == "umap":
         import umap
-        return umap.UMAP(n_components=2, random_state=seed).fit_transform(zs), sel
+        return umap.UMAP(n_components=2, random_state=seed).fit_transform(z[sel]), sel
     raise ValueError("method must be 'pca', 'tsne' or 'umap'")
 
 
-def scatter_maps(xy, panels, size=4):
-    """One scatter per entry of `panels` (name -> values for the same points). Text/object values are treated as
-    categories, numbers as a colour scale."""
+_PANEL_TITLES = {"t_ns": "time (ns)", "err": "frame error (deg)", "n_dih": "number of dihedrals",
+                 "seq": "sequence", "top": "topology", "lay": "lay", "copy": "copy", "run": "run"}
+
+
+def default_panels(data, sel, keys=("run", "seq", "top", "t_ns", "err", "n_dih")):
+    """{title: values} for scatter_maps, in the given order, for the frames `sel`."""
+    return {_PANEL_TITLES.get(k, k): np.asarray(data[k])[sel] for k in keys if k in data}
+
+
+def _category_colors(n):
+    if n <= 10:
+        return plt.cm.tab10(np.arange(n))
+    if n <= 20:
+        return plt.cm.tab20(np.arange(n))
+    return plt.cm.nipy_spectral(np.linspace(0.05, 0.95, n))
+
+
+def scatter_maps(xy, panels, size=5, max_legend=20, alpha=0.85, suptitle=None, ncols=3, save=None, show=False):
+    """
+    One scatter per entry of `panels` (title -> values for the same points).
+    Text values are categories: every category gets a colour and a legend entry with its number of points. With
+    more than `max_legend` categories the largest ones are coloured and listed, the rest are grey ('other').
+    Numbers get a colour bar labelled with the panel title. Panels wrap into rows of `ncols`.
+    """
     n = len(panels)
-    fig, axs = plt.subplots(1, n, figsize=(4.6 * n, 4), squeeze=False)
-    for ax, (name, v) in zip(axs[0], panels.items()):
+    cols_n = min(ncols, n)
+    rows_n = int(np.ceil(n / cols_n))
+    fig, axs = plt.subplots(rows_n, cols_n, figsize=(5.6 * cols_n, 5.4 * rows_n), squeeze=False)
+    for ax in axs.ravel()[n:]:
+        ax.axis("off")
+    for ax, (name, v) in zip(axs.ravel(), panels.items()):
         v = np.asarray(v)
         if v.dtype == object or v.dtype.kind in "US":
-            codes = np.unique(v, return_inverse=True)[1]
-            sc = ax.scatter(xy[:, 0], xy[:, 1], c=codes, s=size, cmap="tab20" if codes.max() < 20 else "nipy_spectral")
-            ax.set_title(f"{name} ({codes.max() + 1} groups)")
+            vs = v.astype(str)
+            cats, inv, cnt = np.unique(vs, return_inverse=True, return_counts=True)
+            order = np.argsort(cnt)[::-1]
+            shown = order[:max_legend]
+            cols = _category_colors(len(shown))
+            rgba = np.tile(np.array([0.78, 0.78, 0.78, 1.0]), (len(vs), 1))
+            handles = []
+            for rank, ci in enumerate(shown):
+                rgba[inv == ci] = cols[rank]
+                handles.append(Line2D([], [], marker="o", ls="", color=cols[rank], markersize=6,
+                                      label=f"{cats[ci]} (n={cnt[ci]:,})"))
+            rest = len(cats) - len(shown)
+            if rest > 0:
+                handles.append(Line2D([], [], marker="o", ls="", color=(0.78, 0.78, 0.78), markersize=6,
+                                      label=f"other ({rest} groups, n={cnt[order[len(shown):]].sum():,})"))
+            ax.scatter(xy[:, 0], xy[:, 1], c=rgba, s=size, alpha=alpha, linewidths=0)
+            ax.set_title(f"{name}: {len(cats)} groups")
+            ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.04), ncol=2, fontsize=7,
+                      frameon=False, title=f"colour = {name}", title_fontsize=8)
         else:
-            sc = ax.scatter(xy[:, 0], xy[:, 1], c=v, s=size, cmap="viridis")
-            ax.set_title(name); fig.colorbar(sc, ax=ax)
+            sc = ax.scatter(xy[:, 0], xy[:, 1], c=v, s=size, cmap="viridis", alpha=alpha, linewidths=0)
+            ax.set_title(name)
+            fig.colorbar(sc, ax=ax, label=name)
         ax.set_xticks([]); ax.set_yticks([])
-    fig.tight_layout(); plt.show()
+    if suptitle:
+        fig.suptitle(suptitle)
+    fig.tight_layout()
+    if save:
+        fig.savefig(save, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig
 
 
-def latent_dihedral_corr(scores, true_deg, valid, names, n_dims=16, top=3):
+def highlight_groups(xy, values, title="group", max_groups=12, ncols=4, size=5, save=None, show=False):
+    """Small multiples: one panel per category, that category in colour on top of all frames in grey.
+    Shows where each group sits and how much groups overlap. Largest `max_groups` categories only."""
+    v = np.asarray(values).astype(str)
+    cats, cnt = np.unique(v, return_counts=True)
+    order = np.argsort(cnt)[::-1][:max_groups]
+    n = len(order)
+    cols_n = min(ncols, n)
+    rows_n = int(np.ceil(n / cols_n))
+    fig, axs = plt.subplots(rows_n, cols_n, figsize=(4.2 * cols_n, 4.0 * rows_n), squeeze=False, sharex=True, sharey=True)
+    for ax in axs.ravel()[n:]:
+        ax.axis("off")
+    colors = _category_colors(n)
+    for ax, ci, c in zip(axs.ravel(), order, colors):
+        ax.scatter(xy[:, 0], xy[:, 1], s=size * 0.6, color=(0.85, 0.85, 0.85), linewidths=0)
+        m = v == cats[ci]
+        ax.scatter(xy[m, 0], xy[m, 1], s=size, color=c, linewidths=0)
+        ax.set_title(f"{cats[ci]} (n={cnt[ci]:,})", fontsize=9)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle(f"each {title} highlighted (colour) against all frames (grey)")
+    fig.tight_layout()
+    if save:
+        fig.savefig(save, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig
+
+
+def latent_dihedral_corr(scores, true_deg, valid, names, n_dims=12, top=3):
     """
     How strongly each (PCA-ordered) latent axis relates to each dihedral: max(|corr with cos|, |corr with sin|),
     computed only over frames where the dihedral exists. Values near 1 = that axis tracks that dihedral.

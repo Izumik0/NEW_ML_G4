@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 # -------- Config -------------
 
 # --------- Files config --------------
-IN_DIR = "../cache_dihedrals"
-OUT_DIR = "dihedrals_ts_test/"
+IN_DIR = "../Autoencoder/cache_dihedrals"
+OUT_DIR = "../dihedrals_ts_test/"
 csv_file = "../lifetimes_data_simple.csv"
 
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -45,6 +45,8 @@ if (device == torch.device("cuda") and sys.platform.startswith("linux")):
  n_workers = 4
 else:
  n_workers = 0
+
+device = torch.device("cpu")
 
 print(f'device:{device}, n_workers:{n_workers}')
 # ------------ helpers --------------

@@ -4,6 +4,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+import os
+os.environ["NUMBA_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+import matplotlib
+matplotlib.use('Agg')
 
 
 #some things
@@ -166,7 +172,7 @@ def pca(z):
                 pr=float(var.sum() ** 2 / (var ** 2).sum()))
 
 
-def plot_overview(z, p):
+def plot_overview(z, p, out_path=None, out_name=None, save = None):
     std = z.std(0)
     active = int((std > 0.01 * std.max()).sum())
     cum = np.cumsum(p["ratio"])
@@ -183,7 +189,8 @@ def plot_overview(z, p):
     c = np.corrcoef(z[:, keep].T) if keep.sum() > 1 else np.ones((1, 1))
     im = ax[2].imshow(c, cmap="coolwarm", vmin=-1, vmax=1)
     ax[2].set_title("Correlation between active dimensions"); fig.colorbar(im, ax=ax[2])
-    fig.tight_layout(); plt.show()
+    if save is not None:
+        plt.savefig(os.path.join(out_path, out_name))
 
 
 def embed_2d(z, method="pca", max_points=20000, seed=0, mask=None, pca_fit="all"):
@@ -234,7 +241,7 @@ def _category_colors(n):
     return plt.cm.nipy_spectral(np.linspace(0.05, 0.95, n))
 
 
-def scatter_maps(xy, panels, size=5, max_legend=20, alpha=0.85, suptitle=None, ncols=3, save=None, show=False):
+def scatter_maps(xy, panels, size=5, max_legend=20, alpha=0.85, suptitle=None, ncols=3, save=None, show=False, out_path=None, out_name=None):
     """
     One scatter per entry of `panels` (title -> values for the same points).
     Text values are categories: every category gets a colour and a legend entry with its number of points. With
@@ -277,14 +284,12 @@ def scatter_maps(xy, panels, size=5, max_legend=20, alpha=0.85, suptitle=None, n
     if suptitle:
         fig.suptitle(suptitle)
     fig.tight_layout()
-    if save:
-        fig.savefig(save, dpi=150, bbox_inches="tight")
-    if show:
-        plt.show()
+    if save is not None:
+        fig.savefig(os.path.join(out_path, out_name))
     return fig
 
 
-def highlight_groups(xy, values, title="group", max_groups=12, ncols=4, size=5, save=None, show=False):
+def highlight_groups(xy, values, title="group", max_groups=12, ncols=4, size=5, save=None, show=False,out_path=None, out_name=None):
     """Small multiples: one panel per category, that category in colour on top of all frames in grey.
     Shows where each group sits and how much groups overlap. Largest `max_groups` categories only."""
     v = np.asarray(values).astype(str)
@@ -305,10 +310,8 @@ def highlight_groups(xy, values, title="group", max_groups=12, ncols=4, size=5, 
         ax.set_xticks([]); ax.set_yticks([])
     fig.suptitle(f"each {title} highlighted (colour) against all frames (grey)")
     fig.tight_layout()
-    if save:
-        fig.savefig(save, dpi=150, bbox_inches="tight")
-    if show:
-        plt.show()
+    if save is not None:
+        fig.savefig(os.path.join(out_path, out_name))
     return fig
 
 
@@ -359,7 +362,7 @@ def plot_paths(ang, xvals, names, valid_cols, xlabel, title, top=8):
     for j in order:
         ax.plot(xvals, np.degrees(np.unwrap(np.radians(ang[:, j]))), marker="o", ms=3, label=f"{names[j]} ({spread[j]:.0f}°)")
     ax.set(xlabel=xlabel, ylabel="decoded angle (deg, unwrapped)", title=title)
-    ax.legend(fontsize=7, ncol=2); fig.tight_layout(); plt.show()
+    ax.legend(fontsize=7, ncol=2); fig.tight_layout()
     return spread
 
 
@@ -381,7 +384,7 @@ def interpolate(decode_fn, z_a, z_b, names, valid_cols, n=11):
     return ang
 
 
-def error_vs_distance(z, err):
+def error_vs_distance(z, err, save=None, out_folder=None, out_name=None):
     """Do frames far from the centre of the code cloud reconstruct worse? Prints a rank correlation."""
     dist = np.linalg.norm(z - z.mean(0), axis=1)
     ok = np.isfinite(err)
@@ -390,5 +393,7 @@ def error_vs_distance(z, err):
     fig, ax = plt.subplots(figsize=(5, 4))
     ax.scatter(dist[ok], err[ok], s=3, alpha=0.4)
     ax.set(xlabel="distance from the centre of the codes", ylabel="frame error (deg)", title=f"rank correlation {rho:.2f}")
-    fig.tight_layout(); plt.show()
+    fig.tight_layout()
+    if save is not None:
+        fig.savefig(os.path.join(out_folder, out_name), bbox_inches='tight')
     return rho

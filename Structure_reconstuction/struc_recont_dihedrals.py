@@ -22,13 +22,17 @@ import seaborn as sns
 # Config - that can be changed
 # ====================================================================
 
+#------------ Data preparation mode --------------------
+mode_data="AE"  # "AE" - for data prep with Autoencoder (it needs AE weights), "raw" - for using data without Autoencoder
+AE_weights_path = Path('../results_real/AE_dihedral_261026/dihedral_ae_n_v1/all_runs_streamed/models/ae_latent64.pt')
+
 # ----------- Dir config -----------
 IN_DIR = Path('../Autoencoder/cache_dihedrals/')
 OUT_DIR = Path('../struc_rec_dih_test/')
-STRIDE = 25                       # only cache files ending in _s<STRIDE>.npy (or -kopia.npy) are used
+STRIDE = 25                       # only cache files ending in _s<STRIDE>.npy are used
 
 # ----------- Data config -----------
-N_COLS = 138                      # dihedral columns, shorter runs are zero-padded at the end
+N_COLS = 118                      # dihedral columns, shorter runs are zero-padded at the end
 frames_train = 500                # frames per training run (upper bound, see max_samples_per_epoch)
 max_samples_per_epoch = 200_000   # caps the epoch size when there are many runs
 frames_val = 20
@@ -110,6 +114,13 @@ PAT = re.compile(rf"{SEP}([1-4]{{3}}){SEP}({ALT}){SEP}")
 # ====================================================================
 # Helpers
 # ====================================================================
+def load_coder(cpkt, device):
+    ck=torch.load(cpkt, map_location=device, weights_only=False)
+    model = AE(ck['n_in'], ck['latent'], HIDDEN=tuple(ck['hidden']))
+    model.load_state_dict(ck['state_dict'])
+    model.eval().to(device)
+    return model, list(ck['all_names']), ck
+
 def labels_from_path(name, vocab):
     """File name -> 3 token ids. Name looks like ..._<seq 3 digits>_<top raw>_...  e.g. _113_-ld+p_"""
     hits = list(PAT.finditer(str(name)))
@@ -202,21 +213,26 @@ def make_loaders(manifest, train_runs, val_runs, test_runs, bs=batch_size, worke
 
 
 @torch.no_grad()
-def eval_loss(model, dl, criterion):
+def eval_loss(model, dl, criterion, AE_model):
     model.eval()
     tot, n = 0.0, 0
     for x, y in dl:
         x, y = x.to(device), y.to(device)
+        if mode_data=="AE":
+            x = AE_model(x).to(device)
         tot += criterion(model(x), y).item() * len(x)
         n += len(x)
     return tot / n
 
 
 @torch.no_grad()
-def eval_per_run(model, dl, runs, manifest, frames, device):
+def eval_per_run(model, dl, runs, manifest, frames, device, AE_model):
     """dl must come from a fixed=True dataset built from `runs`, shuffle=False, with `frames` frames per run."""
     model.eval()
-    probs = torch.cat([torch.softmax(model(x.to(device)), dim=1).cpu() for x, _ in dl])   # (N, 20, 3)
+    if mode_data=="AE":
+        probs = torch.cat([torch.softmax(model(AE_model(x.to(device))), dim=1).cpu() for x, _ in dl])  # (N, 20, 3)
+    else:
+        probs = torch.cat([torch.softmax(model(x.to(device)), dim=1).cpu() for x, _ in dl])   # (N, 20, 3)
     probs = probs.view(len(runs), frames, 20, 3).mean(1)       # one prediction per run
     conf, pred = probs.max(1)                                  # (n_runs, 3)
     y = torch.tensor([manifest[r]["labels"] for r in runs])
@@ -235,11 +251,24 @@ def coverage_report(manifest, train_runs, test_runs):
 # ====================================================================
 # Model
 # ====================================================================
-in_dim = 2 * N_COLS
+n_imp = 2 * N_COLS
+# Autoencoder class
+class AE(nn.Module):
+    def __init__(self, n_in, latent, HIDDEN):
+        super().__init__()
+        h1, h2 = HIDDEN
+        self.enc = nn.Sequential(nn.Linear(n_in, h1), nn.GELU(), nn.Linear(h1, h2), nn.GELU(),
+                                 nn.Linear(h2, latent))
+        self.dec = nn.Sequential(nn.Linear(latent, h2), nn.GELU(), nn.Linear(h2, h1), nn.GELU(),
+                                 nn.Linear(h1, n_in), nn.Tanh())
+
+    def forward(self, x):
+        return self.enc(x)
 
 
+# model class
 class StructuralPred(nn.Module):
-    def __init__(self, in_dim=in_dim, out_dim=3, num_tokens=20, hidden_dim=hidden_dims):
+    def __init__(self, in_dim, out_dim=3, num_tokens=20, hidden_dim=hidden_dims):
         super().__init__()
         self.num_tokens = num_tokens
         self.out_dim = out_dim
@@ -350,10 +379,21 @@ def main():
     print(f"train {len(train_runs)} | val {len(val_runs)} | test {len(test_runs)} runs", flush=True)
     coverage_report(manifest, train_runs, test_runs)
 
+    # --------- Autoencoder load if needed ------------------
+    if mode_data == "AE":
+        AE, _, _ = load_coder(AE_weights_path, device)
+        for params in AE.parameters():
+            params.requires_grad = False
+        input_size = [module for module in AE.modules() if isinstance(module, torch.nn.Linear)][2].out_features
+        print(f'Autoencoder is used, and this is: {AE_weights_path.stem}', flush=True)
+
+    else:
+        input_size = 2*N_COLS
+
     # ---------- loaders, model ----------
     train_loader, val_loader, test_loader = make_loaders(manifest, train_runs, val_runs, test_runs)
     print(f"{len(train_loader)} batches per epoch", flush=True)
-    model = StructuralPred().to(device)
+    model = StructuralPred(in_dim=input_size).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
     criterion = nn.CrossEntropyLoss()
 
@@ -365,6 +405,8 @@ def main():
         total = 0.0
         for b, (batch_x, batch_y) in enumerate(train_loader):
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            if mode_data == 'AE':
+                batch_x = AE(batch_x).to(device)
             optimizer.zero_grad()
             loss = criterion(model(batch_x), batch_y)
             loss.backward()
@@ -374,7 +416,7 @@ def main():
                 print(f"epoch {epoch + 1}/{epoches} batch {b}/{len(train_loader)} "
                       f"loss {loss.item():.4f} {time.time() - t0:.0f}s", flush=True)
         train_loss = total / len(train_loader)
-        val_loss = eval_loss(model, val_loader, criterion)
+        val_loss = eval_loss(model, val_loader, criterion, AE)
         print(f"Epoch {epoch + 1}/{epoches} | train loss {train_loss:.4f} | val loss {val_loss:.4f} "
               f"| {time.time() - t0:.0f}s", flush=True)
 
@@ -392,7 +434,7 @@ def main():
     model.load_state_dict(best_state)
 
     tok_acc, seq_acc, two_of_three, pred, actual, conf = eval_per_run(
-        model, test_loader, test_runs, manifest, frames=frames_test, device=device)
+        model, test_loader, test_runs, manifest, frames=frames_test, device=device, AE_model=AE)
     print(f"Token acc: {tok_acc:.2f}% | Seq acc: {seq_acc:.2f}% | 2 of 3 tokens: {two_of_three:.2f}%", flush=True)
 
     y_true, y_pred, conf = actual.numpy(), pred.numpy(), conf.numpy()          # (n_runs, 3) each

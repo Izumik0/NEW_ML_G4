@@ -10,8 +10,8 @@ from pathlib import Path
 
 # ---------- DATA ------------------
 CSV = '../lifetimes_data_simple.csv'
-NPZ_DIR = Path('../distance_matrix/')
-Cache_dir = Path('../cache_matrix'); Cache_dir.mkdir(exist_ok=True)
+NPZ_DIR = Path('../data/distance_matrix/')
+Cache_dir = Path('cache_matrix'); Cache_dir.mkdir(exist_ok=True)
 NPZ_key = None
 Store_DTYPE = np.float32
 Include_C=False

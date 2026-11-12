@@ -21,7 +21,7 @@ import torch.nn as nn
 # =====================================================================
 
 # Data location config
-DATA_GLOB = "../dihedrals/*/bb_dihedrals.txt"
+DATA_GLOB = "../data/dihedrals/*/bb_dihedrals.txt"
 CACHE_DIR = Path("cache_dihedrals")
 OUT_DIR = Path("../dihedral_ae_out_stream")
 

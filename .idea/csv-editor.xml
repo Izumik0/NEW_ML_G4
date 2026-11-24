@@ -17,6 +17,20 @@
             </Attribute>
           </value>
         </entry>
+        <entry key="/early_warning_test/auc_by_lead_time.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/early_warning_test/test_window_predictions.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
         <entry key="/lifetimes_data_simple.csv">
           <value>
             <Attribute>

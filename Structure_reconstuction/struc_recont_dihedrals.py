@@ -29,11 +29,11 @@ AE_weights_path = Path('../results_real/AE_dihedral_261026/dihedral_ae_n_v1/all_
 # ----------- Dir config -----------
 IN_DIR = Path('../Autoencoder/cache_dihedrals/')
 OUT_DIR = Path('../struc_rec_dih_test/')
-STRIDE = 25                       # only cache files ending in _s<STRIDE>.npy are used
+STRIDE = 50                       # only cache files ending in _s<STRIDE>.npy are used
 
 # ----------- Data config -----------
 N_COLS = 118                      # dihedral columns, shorter runs are zero-padded at the end
-frames_train = 500                # frames per training run (upper bound, see max_samples_per_epoch)
+frames_train = 5000                # frames per training run (upper bound, see max_samples_per_epoch)
 max_samples_per_epoch = 200_000   # caps the epoch size when there are many runs
 frames_val = 20
 frames_test = 150
@@ -46,10 +46,11 @@ batch_size = 256
 drop = 0.3
 LR = 1e-5
 WD = 1e-3
+invalid_top_weight = 2.0          # penalty weight for topology triples not in replace_vocab
 patience = 5
-epoches = 10
+epoches = 100
 rnd_state = 69
-log_every = 100                   # print progress every N batches
+log_every = 50                   # print progress every N batches
 
 # ---------- Hardware related things -----------
 if torch.cuda.is_available():
@@ -121,6 +122,7 @@ def load_coder(cpkt, device):
     model.eval().to(device)
     return model, list(ck['all_names']), ck
 
+
 def labels_from_path(name, vocab):
     """File name -> 3 token ids. Name looks like ..._<seq 3 digits>_<top raw>_...  e.g. _113_-ld+p_"""
     hits = list(PAT.finditer(str(name)))
@@ -164,6 +166,32 @@ def build_manifest(in_dir, stride):
     return manifest, skipped
 
 
+def get_invalid_top_triples(device):
+    valid = set(replace_vocab.values())
+    bad = []
+    for i, t0 in enumerate(vocab_top):
+        for j, t1 in enumerate(vocab_top):
+            for k, t2 in enumerate(vocab_top):
+                if f"{t0}_{t1}_{t2}" not in valid:
+                    bad.append((i, j, k))
+    return torch.tensor(bad, dtype=torch.long, device=device)
+
+
+def loss_fn(logits, y, criterion, top_ids, bad_triples, weight):
+    ce = criterion(logits, y)
+    if weight <= 0.0 or len(bad_triples) == 0:
+        return ce, torch.tensor(0.0, device=logits.device)
+    probs = torch.softmax(logits, dim=1)                                  # (B, 20, 3)
+    top_p = torch.stack([probs[:, top_ids[t], :].sum(dim=1) for t in vocab_top], dim=1)  # (B, 5, 3)
+    inv_p = (top_p[:, bad_triples[:, 0], 0] * top_p[:, bad_triples[:, 1], 1] * top_p[:, bad_triples[:, 2], 2]).sum(dim=1).mean()
+    return ce + weight * inv_p, inv_p
+
+
+def forward_x(x, AE_model):
+    x = x.to(device)
+    return AE_model(x).to(device) if (mode_data == "AE" and AE_model is not None) else x
+
+
 class DihedralDataset(Dataset):
     """fixed=True : evenly spaced frames of every run, same order every time (val / test, run-major).
        fixed=False: n_samples random (run, frame) pairs per epoch (training)."""
@@ -188,7 +216,7 @@ class DihedralDataset(Dataset):
             ri = int(torch.randint(len(self.runs), (1,)))
             t = int(torch.randint(int(self.T[ri]), (1,)))
         r = self.runs[ri]
-        row = np.array(np.load(self.m[r]["cache_file"], mmap_mode="r")[t], dtype=np.float32)   # one row, degrees
+        row = np.array(np.load(self.m[r]["cache_file"], mmap_mode="r")[t], dtype=np.float32)[:N_COLS]   # one row, degrees
         deg = np.zeros(N_COLS, np.float32); deg[:len(row)] = row
         ok = np.zeros(N_COLS, np.float32);  ok[:len(row)] = 1
         rad = np.deg2rad(deg)
@@ -208,31 +236,29 @@ def make_loaders(manifest, train_runs, val_runs, test_runs, bs=batch_size, worke
                     batch_size=bs, shuffle=False, num_workers=w_eval,
                     persistent_workers=w_eval > 0, pin_memory=pin)
     te = DataLoader(DihedralDataset(test_runs, manifest, frames_test),
-                    batch_size=bs, shuffle=False, num_workers=w_eval, pin_memory=pin)
+                    batch_size=bs, shuffle=False, num_workers=w_eval,
+                    persistent_workers=w_eval > 0, pin_memory=pin)
     return tr, va, te
 
 
 @torch.no_grad()
-def eval_loss(model, dl, criterion, AE_model):
+def eval_loss(model, dl, criterion, top_ids, bad_triples, AE_model):
     model.eval()
-    tot, n = 0.0, 0
+    tot, inv_tot, n = 0.0, 0.0, 0
     for x, y in dl:
-        x, y = x.to(device), y.to(device)
-        if mode_data=="AE":
-            x = AE_model(x).to(device)
-        tot += criterion(model(x), y).item() * len(x)
+        x, y = forward_x(x, AE_model), y.to(device)
+        loss, inv_p = loss_fn(model(x), y, criterion, top_ids, bad_triples, invalid_top_weight)
+        tot += loss.item() * len(x)
+        inv_tot += inv_p.item() * len(x)
         n += len(x)
-    return tot / n
+    return tot / n, inv_tot / n
 
 
 @torch.no_grad()
 def eval_per_run(model, dl, runs, manifest, frames, device, AE_model):
     """dl must come from a fixed=True dataset built from `runs`, shuffle=False, with `frames` frames per run."""
     model.eval()
-    if mode_data=="AE":
-        probs = torch.cat([torch.softmax(model(AE_model(x.to(device))), dim=1).cpu() for x, _ in dl])  # (N, 20, 3)
-    else:
-        probs = torch.cat([torch.softmax(model(x.to(device)), dim=1).cpu() for x, _ in dl])   # (N, 20, 3)
+    probs = torch.cat([torch.softmax(model(forward_x(x, AE_model)), dim=1).cpu() for x, _ in dl])  # (N, 20, 3)
     probs = probs.view(len(runs), frames, 20, 3).mean(1)       # one prediction per run
     conf, pred = probs.max(1)                                  # (n_runs, 3)
     y = torch.tensor([manifest[r]["labels"] for r in runs])
@@ -351,8 +377,11 @@ def save_predictions_csv(path, test_runs, y_true, y_pred, conf):
 # Main
 # ====================================================================
 def main():
-    print(f'device:{device}, n_workers:{n_workers}', flush=True)
+    print(f'device:{device}, n_workers:{n_workers}, mode_data:{mode_data}', flush=True)
     os.makedirs(OUT_DIR, exist_ok=True)
+
+    top_ids = {t: [vocab[f"{t}_{s}"] for s in vocab_seq] for t in vocab_top}
+    bad_triples = get_invalid_top_triples(device)
 
     # ---------- manifest ----------
     manifest, skipped = build_manifest(IN_DIR, STRIDE)
@@ -380,15 +409,16 @@ def main():
     coverage_report(manifest, train_runs, test_runs)
 
     # --------- Autoencoder load if needed ------------------
+    AE = None
     if mode_data == "AE":
         AE, _, _ = load_coder(AE_weights_path, device)
         for params in AE.parameters():
             params.requires_grad = False
         input_size = [module for module in AE.modules() if isinstance(module, torch.nn.Linear)][2].out_features
         print(f'Autoencoder is used, and this is: {AE_weights_path.stem}', flush=True)
-
     else:
-        input_size = 2*N_COLS
+        input_size = 2 * N_COLS
+        print('Raw dihedrals are used', flush=True)
 
     # ---------- loaders, model ----------
     train_loader, val_loader, test_loader = make_loaders(manifest, train_runs, val_runs, test_runs)
@@ -404,21 +434,19 @@ def main():
         model.train()
         total = 0.0
         for b, (batch_x, batch_y) in enumerate(train_loader):
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            if mode_data == 'AE':
-                batch_x = AE(batch_x).to(device)
+            batch_x, batch_y = forward_x(batch_x, AE), batch_y.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(batch_x), batch_y)
+            loss, inv_p = loss_fn(model(batch_x), batch_y, criterion, top_ids, bad_triples, invalid_top_weight)
             loss.backward()
             optimizer.step()
             total += loss.item()
             if b % log_every == 0:
                 print(f"epoch {epoch + 1}/{epoches} batch {b}/{len(train_loader)} "
-                      f"loss {loss.item():.4f} {time.time() - t0:.0f}s", flush=True)
+                      f"loss {loss.item():.4f} (inv_p {inv_p.item():.4f}) {time.time() - t0:.0f}s", flush=True)
         train_loss = total / len(train_loader)
-        val_loss = eval_loss(model, val_loader, criterion, AE)
+        val_loss, val_inv_p = eval_loss(model, val_loader, criterion, top_ids, bad_triples, AE)
         print(f"Epoch {epoch + 1}/{epoches} | train loss {train_loss:.4f} | val loss {val_loss:.4f} "
-              f"| {time.time() - t0:.0f}s", flush=True)
+              f"(inv_p {val_inv_p:.4f}) | {time.time() - t0:.0f}s", flush=True)
 
         if val_loss < best_val:
             best_val, bad_epochs = val_loss, 0

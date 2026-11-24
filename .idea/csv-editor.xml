@@ -10,14 +10,7 @@
             </Attribute>
           </value>
         </entry>
-        <entry key="/Autoencoder_results_matrix/rmse_by_condition.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="/Autoencoder_results_matrix/summary.csv">
+        <entry key="/Ae_4_res/srtuct_rec_AE_4/predictions.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
@@ -53,6 +46,55 @@
           </value>
         </entry>
         <entry key="/results_real/matrix_ae_271026/matrix_1_AE/summary.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/results_real/results_AE)used/struc_AE_v1/predictions.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/results_real/results_AE)used/struct_AE_v2/predictions.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/results_real/results_AE)used/window_sweep_AE/predictions_all_windows.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/results_real/struc_rec_dih_v3/predictions.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/results_real/window_sweep_results/predictions_all_windows.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/struc_rec_dih_test/predictions.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/wyniki_Maetusz/window_sampling/predictions_all_windows.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />

@@ -23,17 +23,17 @@ import seaborn as sns
 # ====================================================================
 
 #------------ Data preparation mode --------------------
-mode_data="AE"  # "AE" - for data prep with Autoencoder (it needs AE weights), "raw" - for using data without Autoencoder
+mode_data="raw"  # "AE" - for data prep with Autoencoder (it needs AE weights), "raw" - for using data without Autoencoder
 AE_weights_path = Path('../results_real/AE_dihedral_261026/dihedral_ae_n_v1/all_runs_streamed/models/ae_latent64.pt')
 
 # ----------- Dir config -----------
 IN_DIR = Path('../Autoencoder/cache_dihedrals/')
 OUT_DIR = Path('../struc_rec_dih_test/')
-STRIDE = 50                       # only cache files ending in _s<STRIDE>.npy are used
+STRIDE = 25                       # only cache files ending in _s<STRIDE>.npy are used
 
 # ----------- Data config -----------
 N_COLS = 118                      # dihedral columns, shorter runs are zero-padded at the end
-frames_train = 5000                # frames per training run (upper bound, see max_samples_per_epoch)
+frames_train = 500                # frames per training run (upper bound, see max_samples_per_epoch)
 max_samples_per_epoch = 200_000   # caps the epoch size when there are many runs
 frames_val = 20
 frames_test = 150
@@ -47,10 +47,11 @@ drop = 0.3
 LR = 1e-5
 WD = 1e-3
 invalid_top_weight = 2.0          # penalty weight for topology triples not in replace_vocab
+use_class_weights = False         # True -> inverse-frequency weights in CrossEntropyLoss
 patience = 5
-epoches = 100
+epoches = 10
 rnd_state = 69
-log_every = 50                   # print progress every N batches
+log_every = 100                   # print progress every N batches
 
 # ---------- Hardware related things -----------
 if torch.cuda.is_available():
@@ -164,6 +165,47 @@ def build_manifest(in_dir, stride):
             continue
         manifest[base] = {"cache_file": str(f), "labels": labels, "n_frames": int(T), "n_cols": int(C)}
     return manifest, skipped
+
+
+def check_imbalance(manifest, train_runs, out_dir):
+    """Checks token distribution across all runs and train runs; returns inverse-frequency weights."""
+    n_tok = len(vocab)
+    all_counts = np.zeros(n_tok, dtype=np.int64)
+    for r in manifest:
+        for t in manifest[r]["labels"]:
+            all_counts[t] += 1
+
+    tr_counts = np.zeros(n_tok, dtype=np.int64)
+    for r in train_runs:
+        for t in manifest[r]["labels"]:
+            tr_counts[t] += 1
+
+    total_tr = tr_counts.sum()
+    nonzero = tr_counts[tr_counts > 0]
+    ratio = (nonzero.max() / nonzero.min()) if len(nonzero) > 0 else float("inf")
+    zero_tokens = [inverse_vocab[i] for i, c in enumerate(tr_counts) if c == 0]
+
+    print(f"Token imbalance (train, {total_tr} slots): max/min={ratio:.2f}x | missing in train={zero_tokens}", flush=True)
+    order = np.argsort(-tr_counts)
+    for idx in order:
+        pct = (tr_counts[idx] / total_tr * 100.0) if total_tr > 0 else 0.0
+        print(f"  {inverse_vocab[idx]:5s}: train={tr_counts[idx]:5d} ({pct:5.2f}%) | all={all_counts[idx]:5d}", flush=True)
+
+    df = pd.DataFrame({
+        "token_id": np.arange(n_tok),
+        "token": [inverse_vocab[i] for i in range(n_tok)],
+        "train_count": tr_counts,
+        "train_pct": np.round(tr_counts / max(total_tr, 1) * 100.0, 4),
+        "all_count": all_counts,
+    }).sort_values("train_count", ascending=False)
+    df.to_csv(out_dir / "token_imbalance.csv", index=False)
+
+    weights = np.zeros(n_tok, dtype=np.float32)
+    for i, c in enumerate(tr_counts):
+        weights[i] = (total_tr / (n_tok * c)) if c > 0 else 0.0
+    if weights.sum() > 0:
+        weights = weights / weights[weights > 0].mean()
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 def get_invalid_top_triples(device):
@@ -407,6 +449,7 @@ def main():
     val_runs = [trainval_runs[i] for i in va2]
     print(f"train {len(train_runs)} | val {len(val_runs)} | test {len(test_runs)} runs", flush=True)
     coverage_report(manifest, train_runs, test_runs)
+    cls_weights = check_imbalance(manifest, train_runs, OUT_DIR).to(device)
 
     # --------- Autoencoder load if needed ------------------
     AE = None
@@ -425,7 +468,7 @@ def main():
     print(f"{len(train_loader)} batches per epoch", flush=True)
     model = StructuralPred(in_dim=input_size).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=cls_weights if use_class_weights else None)
 
     # ---------- training (early stopping on validation loss) ----------
     best_val, bad_epochs, best_state = float('inf'), 0, None
